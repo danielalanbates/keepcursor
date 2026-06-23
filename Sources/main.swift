@@ -30,6 +30,8 @@ import Carbon.HIToolbox
 enum Keys {
     static let enabled = "enabled"
     static let watchAllGames = "watchAllGames"
+    static let keepSize = "keepSize"
+    static let cursorScale = "cursorScale"
 }
 
 final class Settings {
@@ -37,7 +39,12 @@ final class Settings {
     private let d = UserDefaults.standard
 
     init() {
-        d.register(defaults: [Keys.enabled: true, Keys.watchAllGames: false])
+        d.register(defaults: [
+            Keys.enabled: true,
+            Keys.watchAllGames: false,
+            Keys.keepSize: true,
+            Keys.cursorScale: 2.0,   // 2nd-from-bottom on the 1.0–4.0 scale
+        ])
     }
     var enabled: Bool {
         get { d.bool(forKey: Keys.enabled) }
@@ -46,6 +53,62 @@ final class Settings {
     var watchAllGames: Bool {
         get { d.bool(forKey: Keys.watchAllGames) }
         set { d.set(newValue, forKey: Keys.watchAllGames) }
+    }
+    /// When on, KeepCursor pins the system cursor size to `cursorScale`,
+    /// re-applying it whenever something (e.g. a game's display-mode switch)
+    /// resets it back to the smallest size.
+    var keepSize: Bool {
+        get { d.bool(forKey: Keys.keepSize) }
+        set { d.set(newValue, forKey: Keys.keepSize) }
+    }
+    /// Desired cursor scale, 1.0 (smallest) … 4.0 (largest).
+    var cursorScale: Double {
+        get { min(4.0, max(1.0, d.double(forKey: Keys.cursorScale))) }
+        set { d.set(min(4.0, max(1.0, newValue)), forKey: Keys.cursorScale) }
+    }
+}
+
+// MARK: - Cursor size (SkyLight private API)
+//
+// The Accessibility "Pointer size" preference (mouseDriverCursorSize) is
+// DECOUPLED from the live WindowServer cursor scale on current macOS — writing
+// the pref does not change the rendered cursor. The only reliable lever is
+// SkyLight's CGSGetCursorScale / CGSSetCursorScale. A display-mode change
+// (common when a full-screen game launches / alt-tabs) resets the live scale
+// back to 1.0, which is why the cursor felt "permanently stuck smallest".
+
+enum CursorScale {
+    typealias ConnID = UInt32
+    private typealias MainConnFn = @convention(c) () -> ConnID
+    private typealias GetFn = @convention(c) (ConnID, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetFn = @convention(c) (ConnID, Float) -> Int32
+
+    private static let handle = dlopen(
+        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+
+    private static func sym<T>(_ name: String) -> T? {
+        guard let h = handle, let p = dlsym(h, name) else { return nil }
+        return unsafeBitCast(p, to: T.self)
+    }
+    private static let mainConn: MainConnFn? = sym("CGSMainConnectionID")
+    private static let getFn: GetFn? = sym("CGSGetCursorScale")
+    private static let setFn: SetFn? = sym("CGSSetCursorScale")
+
+    static var available: Bool { mainConn != nil && getFn != nil && setFn != nil }
+
+    static func current() -> Float? {
+        guard let mc = mainConn, let g = getFn else { return nil }
+        var s: Float = -1
+        return g(mc(), &s) == 0 ? s : nil
+    }
+    static func set(_ value: Float) {
+        guard let mc = mainConn, let st = setFn else { return }
+        _ = st(mc(), max(1.0, min(4.0, value)))
+    }
+    /// Re-apply the target only if the live scale has drifted (avoids needless writes).
+    static func enforce(_ target: Float) {
+        guard let cur = current() else { set(target); return }
+        if abs(cur - target) > 0.01 { set(target) }
     }
 }
 
@@ -148,6 +211,57 @@ final class Hotkey {
     }
 }
 
+// MARK: - Cursor-size slider (custom menu item view)
+
+final class CursorSizeMenuView: NSView {
+    private let titleLabel = NSTextField(labelWithString: "Cursor size")
+    private let valueLabel = NSTextField(labelWithString: "")
+    private let slider = NSSlider()
+    private let onChange: (Double) -> Void
+
+    init(value: Double, onChange: @escaping (Double) -> Void) {
+        self.onChange = onChange
+        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 56))
+
+        titleLabel.font = .menuFont(ofSize: 0)
+        titleLabel.textColor = .labelColor
+        titleLabel.frame = NSRect(x: 20, y: 32, width: 130, height: 18)
+        addSubview(titleLabel)
+
+        valueLabel.font = .menuFont(ofSize: 0)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.alignment = .right
+        valueLabel.frame = NSRect(x: 150, y: 32, width: 70, height: 18)
+        addSubview(valueLabel)
+
+        slider.minValue = 1.0
+        slider.maxValue = 4.0
+        slider.numberOfTickMarks = 4
+        slider.allowsTickMarkValuesOnly = false
+        slider.doubleValue = value
+        slider.target = self
+        slider.action = #selector(sliderMoved)
+        slider.frame = NSRect(x: 20, y: 8, width: 200, height: 20)
+        addSubview(slider)
+
+        updateValueLabel(value)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func updateValueLabel(_ v: Double) {
+        valueLabel.stringValue = String(format: "%.1f×", v)
+    }
+    @objc private func sliderMoved() {
+        let v = slider.doubleValue
+        updateValueLabel(v)
+        onChange(v)
+    }
+    func setValue(_ v: Double) {
+        slider.doubleValue = v
+        updateValueLabel(v)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -165,11 +279,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(appActivated(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
-        // Light safety re-check while a target game is frontmost (catches the
-        // in-app alert case where no activation event fires).
+        // Pin the cursor size now, and re-pin the instant a display reconfigures
+        // (a full-screen game switching display mode is what resets it to 1.0).
+        if settings.keepSize { CursorScale.set(Float(settings.cursorScale)) }
+        CGDisplayRegisterReconfigurationCallback({ _, _, _ in
+            if Settings.shared.keepSize {
+                CursorScale.enforce(Float(Settings.shared.cursorScale))
+            }
+        }, nil)
+
+        // Light safety re-check (catches the in-app alert case where no
+        // activation event fires, and any non-display reset of the cursor size).
         safetyTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, self.settings.enabled else { return }
-            if CursorFixer.frontmostIsTarget() { CursorFixer.restoreBurst() }
+            guard let self else { return }
+            if self.settings.enabled, CursorFixer.frontmostIsTarget() {
+                CursorFixer.restoreBurst()
+            }
+            if self.settings.keepSize {
+                CursorScale.enforce(Float(self.settings.cursorScale))
+            }
             self.refreshMenuTitle()
         }
 
@@ -218,6 +346,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(restore)
 
         menu.addItem(.separator())
+
+        // Cursor size section
+        if CursorScale.available {
+            let keepSize = NSMenuItem(title: "Keep cursor size",
+                                      action: #selector(toggleKeepSize), keyEquivalent: "")
+            keepSize.target = self
+            keepSize.state = settings.keepSize ? .on : .off
+            menu.addItem(keepSize)
+
+            let sliderItem = NSMenuItem()
+            let view = CursorSizeMenuView(value: settings.cursorScale) { [weak self] v in
+                guard let self else { return }
+                self.settings.cursorScale = v
+                if self.settings.keepSize { CursorScale.set(Float(v)) }
+            }
+            sliderItem.view = view
+            menu.addItem(sliderItem)
+
+            menu.addItem(.separator())
+        }
 
         let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin),
                                keyEquivalent: "")
@@ -271,6 +419,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func toggleWatchAll() {
         settings.watchAllGames.toggle()
+        rebuildMenu()
+    }
+    @objc private func toggleKeepSize() {
+        settings.keepSize.toggle()
+        if settings.keepSize { CursorScale.set(Float(settings.cursorScale)) }
         rebuildMenu()
     }
     @objc private func restoreNow() {
