@@ -18,12 +18,8 @@ echo "› Copying source off iCloud"
 SRC="$BUILD_DIR/main.swift"
 cp "$ROOT/Sources/main.swift" "$SRC"
 
-echo "› Compiling universal binary (arm64 + x86_64)"
-swiftc -O -target arm64-apple-macos13.0  "$SRC" -o "$BUILD_DIR/${NAME}-arm64"
-swiftc -O -target x86_64-apple-macos13.0 "$SRC" -o "$BUILD_DIR/${NAME}-x86_64"
-lipo -create -output "$APP/Contents/MacOS/$NAME" \
-    "$BUILD_DIR/${NAME}-arm64" "$BUILD_DIR/${NAME}-x86_64"
-rm -f "$BUILD_DIR/${NAME}-arm64" "$BUILD_DIR/${NAME}-x86_64"
+echo "› Compiling native binary"
+swiftc -O "$SRC" -o "$APP/Contents/MacOS/$NAME"
 
 echo "› Installing Info.plist"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"

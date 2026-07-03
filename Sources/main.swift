@@ -130,14 +130,36 @@ enum CursorFixer {
     }
 
     /// Heuristic for "some other full-screen game" when Watch-all-games is on.
-    /// A frontmost app occupying the whole main screen with no menu-bar focus
-    /// is treated as a game. Kept deliberately conservative.
+    /// Two signals, either sufficient:
+    ///   - a known game-host vendor (Blizzard / Steam), or
+    ///   - the app owns an on-screen window covering the entire main display
+    ///     (how full-screen games actually present).
     static func looksLikeFullscreenGame(_ app: NSRunningApplication) -> Bool {
         guard app.activationPolicy == .regular else { return false }
-        // Anything Blizzard / common launchers we always treat as a game host.
         if let bid = app.bundleIdentifier?.lowercased(),
            bid.contains("blizzard") || bid.contains("valvesoftware.steam") {
             return true
+        }
+        return ownsFullscreenWindow(pid: app.processIdentifier)
+    }
+
+    /// True if `pid` owns an on-screen window whose bounds cover the main
+    /// display. Finder/desktop layers are excluded by requiring layer 0..<20
+    /// (normal app windows and full-screen game presentation layers).
+    static func ownsFullscreenWindow(pid: pid_t) -> Bool {
+        guard let screen = NSScreen.main else { return false }
+        let target = CGRect(x: 0, y: 0,
+                            width: screen.frame.width, height: screen.frame.height)
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] else { return false }
+        for win in list {
+            guard let owner = win[kCGWindowOwnerPID as String] as? pid_t, owner == pid,
+                  let layer = win[kCGWindowLayer as String] as? Int, layer >= 0, layer < 20,
+                  let b = win[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+            let rect = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0,
+                              width: b["Width"] ?? 0, height: b["Height"] ?? 0)
+            if rect.width >= target.width, rect.height >= target.height { return true }
         }
         return false
     }
@@ -154,7 +176,15 @@ enum CursorFixer {
     }
 
     /// The core fix. Safe to call frequently and when no game is running.
-    static func restoreBurst() {
+    ///
+    /// `includeWarp: false` runs only the counter-unwind + re-association —
+    /// the parts that are invisible to gameplay. The 1px warp (needed to force
+    /// a hardware-cursor repaint) moves the real cursor, so callers on a
+    /// periodic timer must not fire it every tick: warping once a second while
+    /// someone is aiming in-game reads as input jitter. The warp is also
+    /// skipped outright while any mouse button is held (mid-click / drag /
+    /// camera turn), when a 1px displacement is most likely to be felt.
+    static func restoreBurst(includeWarp: Bool = true) {
         let display = CGMainDisplayID()
 
         // 1. Unwind a possibly-negative hide counter. CGDisplayShowCursor is
@@ -164,11 +194,32 @@ enum CursorFixer {
         // 2. Re-link the mouse to the on-screen cursor (camera grabs unlink it).
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
 
+        guard includeWarp, NSEvent.pressedMouseButtons == 0 else { return }
+
         // 3. Force a hardware-cursor repaint by nudging 1px and back.
         let loc = currentCursorLocationCG()
         let nudged = CGPoint(x: loc.x + 1, y: loc.y)
         CGWarpMouseCursorPosition(nudged)
         CGWarpMouseCursorPosition(loc)
+    }
+
+    /// Whether WindowServer currently reports the cursor as visible. Used by
+    /// the safety timer to decide when the disruptive full burst is warranted.
+    /// CGCursorIsVisible is marked unavailable to Swift (deprecated 10.9) but
+    /// the symbol is still exported by CoreGraphics and still tracks the
+    /// hide/show state we care about — so load it dynamically, same pattern as
+    /// the SkyLight cursor-scale calls. If the symbol ever disappears, fail
+    /// toward "visible" (quiet maintenance only, never spurious warps).
+    private typealias CursorVisibleFn = @convention(c) () -> boolean_t
+    private static let cursorVisibleFn: CursorVisibleFn? = {
+        guard let h = dlopen(nil, RTLD_NOW), let p = dlsym(h, "CGCursorIsVisible") else {
+            return nil
+        }
+        return unsafeBitCast(p, to: CursorVisibleFn.self)
+    }()
+    static var cursorVisible: Bool {
+        guard let fn = cursorVisibleFn else { return true }
+        return fn() != 0
     }
 
     /// Cursor location in CoreGraphics (top-left origin) coordinates.
@@ -270,6 +321,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkey: Hotkey?
     private let settings = Settings.shared
 
+    /// Restores performed this session (visible proof the app is working —
+    /// and the live-WoW verification instrument).
+    private var restoreCount = 0
+
+    private func noteRestore(flash: Bool = true) {
+        restoreCount += 1
+        refreshMenuTitle()
+        if flash { flashIcon() }
+    }
+
     func applicationDidFinishLaunching(_ note: Notification) {
         setupStatusItem()
 
@@ -293,7 +354,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         safetyTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             if self.settings.enabled, CursorFixer.frontmostIsTarget() {
-                CursorFixer.restoreBurst()
+                if CursorFixer.cursorVisible {
+                    // Cursor is fine: quiet maintenance only (counter unwind +
+                    // re-association). No warp — a 1px warp every second while
+                    // someone is playing reads as aim jitter.
+                    CursorFixer.restoreBurst(includeWarp: false)
+                } else {
+                    // Cursor actually lost (the in-app-alert case where no
+                    // activation event fires): full burst, and count it.
+                    CursorFixer.restoreBurst()
+                    self.noteRestore(flash: false)
+                }
             }
             if self.settings.keepSize {
                 CursorScale.enforce(Float(self.settings.cursorScale))
@@ -303,7 +374,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hotkey = Hotkey { [weak self] in
             CursorFixer.restoreBurst()
-            self?.flashIcon()
+            self?.noteRestore()
         }
     }
 
@@ -327,11 +398,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(status)
         menu.addItem(.separator())
 
-        let enabled = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled),
-                                 keyEquivalent: "")
-        enabled.target = self
-        enabled.state = settings.enabled ? .on : .off
-        menu.addItem(enabled)
+        let pauseItem = NSMenuItem(title: settings.enabled ? "Pause" : "Resume",
+                                   action: #selector(toggleEnabled),
+                                   keyEquivalent: "p")
+        pauseItem.target = self
+        menu.addItem(pauseItem)
 
         let watchAll = NSMenuItem(title: "Watch all games (not just WoW)",
                                   action: #selector(toggleWatchAll), keyEquivalent: "")
@@ -389,7 +460,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func statusLine() -> String {
         if !settings.enabled { return "Paused" }
-        return CursorFixer.wowIsRunning() ? "Active — WoW running" : "Watching for WoW…"
+        let base = CursorFixer.wowIsRunning() ? "Active — WoW running" : "Watching for WoW…"
+        return restoreCount > 0 ? "\(base) · restored \(restoreCount)×" : base
     }
 
     private func refreshMenuTitle() {
@@ -411,6 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 CursorFixer.restoreBurst()
             }
         }
+        noteRestore(flash: false) // count the sequence once, not 4×
     }
 
     @objc private func toggleEnabled() {
@@ -428,7 +501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func restoreNow() {
         CursorFixer.restoreBurst()
-        flashIcon()
+        noteRestore()
     }
     @objc private func openSite() {
         if let url = URL(string: "https://batesai.org") { NSWorkspace.shared.open(url) }
@@ -447,27 +520,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Launch at login (SMAppService, macOS 13+)
-
+    /// LaunchAgent path is the single source of truth for login state — a
+    /// UserDefaults mirror drifts the moment the user deletes the plist.
+    private var loginAgentURL: URL {
+        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("LaunchAgents/com.batesai.keep-cursor.plist")
+    }
     private func loginEnabled() -> Bool {
-        if #available(macOS 13.0, *) {
-            return SMAppService.mainApp.status == .enabled
-        }
-        return false
+        FileManager.default.fileExists(atPath: loginAgentURL.path)
     }
     @objc private func toggleLogin() {
-        if #available(macOS 13.0, *) {
-            do {
-                if SMAppService.mainApp.status == .enabled {
-                    try SMAppService.mainApp.unregister()
-                } else {
-                    try SMAppService.mainApp.register()
-                }
-            } catch {
-                NSLog("KeepCursor login toggle failed: \(error)")
-            }
-            rebuildMenu()
+        let enable = !loginEnabled()
+        let fm = FileManager.default
+        let url = loginAgentURL
+        if enable {
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>Label</key>
+                <string>com.batesai.keep-cursor</string>
+                <key>ProgramArguments</key>
+                <array>
+                    <string>\(Bundle.main.bundlePath)/Contents/MacOS/KeepCursor</string>
+                </array>
+                <key>RunAtLoad</key>
+                <true/>
+            </dict>
+            </plist>
+            """
+            try? plist.write(to: url, atomically: true, encoding: .utf8)
+        } else {
+            try? fm.removeItem(at: url)
         }
+        rebuildMenu()
     }
 }
 
