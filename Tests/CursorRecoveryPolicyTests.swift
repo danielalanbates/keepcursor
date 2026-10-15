@@ -104,6 +104,43 @@ enum CursorRecoveryPolicyTests {
                                          atScreenEdge: false, buttons: 0, now: time)
         }
         precondition(!reconnect(15.3)) // Subpixel rounding is not evidence of a stalled cursor.
-        print("Cursor recovery policy passed: holds, release settling, throttling, focus, pause, manual, overlay, explicit/stalled reconnect, failed API consumption, edge/subpixel rejection.")
+        var explicit = ExplicitCursorRescue()
+        var explicitCalls = 0
+        func rescue(_ now: Double, pid: Int32? = 59662, event: Int = 0,
+                    hid: UInt64 = 0, session: UInt64 = 0,
+                    result: CursorReconnectResult = .succeeded) -> CursorReconnectResult? {
+            explicit.service(frontPID: pid, eventButtons: event, hidButtons: hid,
+                             sessionButtons: session, now: now) { observedPID in
+                precondition(observedPID == pid)
+                explicitCalls += 1
+                return result
+            }
+        }
+        explicit.request(now: 0)
+        precondition(rescue(0) == nil)
+        precondition(rescue(0.1, event: 1) == nil)
+        precondition(rescue(0.2, hid: 2) == nil)
+        precondition(rescue(0.3, session: 3) == nil)
+        precondition(rescue(0.4) == nil)
+        precondition(rescue(0.64) == nil)
+        precondition(rescue(0.65) == .succeeded) // Current foreground can be Terminal, not a game.
+        precondition(rescue(5) == nil && explicitCalls == 1) // Exactly one API attempt.
+        explicit.request(now: 6)
+        precondition(rescue(6) == nil)
+        precondition(rescue(6.25, result: .failed) == .failed)
+        precondition(rescue(7) == nil && explicitCalls == 2) // Error consumes the request.
+        explicit.request(now: 8)
+        precondition(rescue(8) == nil)
+        precondition(rescue(8.2, pid: 37122) == nil) // New foreground resets settling.
+        precondition(rescue(8.44, pid: 37122) == nil)
+        precondition(rescue(8.45, pid: 37122, result: .deferred) == .deferred)
+        precondition(explicit.pending)
+        precondition(rescue(8.46, pid: 37122) == nil)
+        precondition(rescue(8.70, pid: 37122) == nil)
+        precondition(rescue(8.72, pid: 37122) == .succeeded)
+        explicit.request(now: 10)
+        precondition(rescue(70.1) == nil && explicit.state == "expired")
+        precondition(!explicit.pending)
+        print("Cursor recovery policy passed: holds, release settling, throttling, focus, pause, manual, overlay, explicit/stalled reconnect, failed API consumption, edge/subpixel rejection, explicit foreground rescue and one-attempt consumption.")
     }
 }

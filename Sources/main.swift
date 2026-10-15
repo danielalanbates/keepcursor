@@ -217,6 +217,38 @@ enum CursorFixer {
         return nil
     }
 
+    static func buttonMask(_ state: CGEventSourceStateID) -> UInt64 {
+        var mask: UInt64 = 0
+        for index in 0..<32 {
+            if let button = CGMouseButton(rawValue: UInt32(index)),
+               CGEventSource.buttonState(state, button: button) {
+                mask |= UInt64(1) << index
+            }
+        }
+        return mask
+    }
+
+    /// Explicit rescue may repair the current foreground app, including the
+    /// desktop. It never activates an app, posts input, or changes cursor position.
+    static func rescueCursorNow(expectedPID: pid_t) -> (CursorReconnectResult, Int32?) {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+              NSEvent.pressedMouseButtons == 0,
+              buttonMask(.hidSystemState) == 0,
+              buttonMask(.combinedSessionState) == 0 else { return (.deferred, nil) }
+        let result = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        NSLog("KeepCursor explicit foreground rescue result: %d", result.rawValue)
+        // Native visibility is a separate best-effort operation, even if the
+        // association API is rejected for this background helper.
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+           NSEvent.pressedMouseButtons == 0,
+           buttonMask(.hidSystemState) == 0,
+           buttonMask(.combinedSessionState) == 0 {
+            SkyLightCursor.forceShow()
+            for _ in 0..<8 { CGDisplayShowCursor(CGMainDisplayID()) }
+        }
+        return (result == .success ? .succeeded : .failed, result.rawValue)
+    }
+
     /// Single input reconnect after an explicit request or verified pointer stall.
     /// This final live guard is essential even when a delayed policy approved it.
     static func reconnectMouse(expectedPID: pid_t?) -> CursorReconnectResult {
@@ -436,6 +468,8 @@ final class CursorOverlayController {
 // MARK: - Global Hotkey (⌥⌘C)
 
 final class Hotkey {
+    private(set) var handlerStatus: OSStatus = noErr
+    private(set) var registrationStatus: OSStatus = noErr
     private var ref: EventHotKeyRef?
     private var handler: EventHandlerRef?
     private let onFire: () -> Void
@@ -449,7 +483,7 @@ final class Hotkey {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind: UInt32(kEventHotKeyPressed))
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, ctx -> OSStatus in
+        handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, event, ctx -> OSStatus in
             guard let ctx else { return noErr }
             let me = Unmanaged<Hotkey>.fromOpaque(ctx).takeUnretainedValue()
             me.onFire()
@@ -458,7 +492,7 @@ final class Hotkey {
         }, 1, &spec, selfPtr, &handler)
 
         let id = EventHotKeyID(signature: OSType(0x4B435552 /* 'KCUR' */), id: 1)
-        RegisterEventHotKey(UInt32(kVK_ANSI_C),
+        registrationStatus = RegisterEventHotKey(UInt32(kVK_ANSI_C),
                             UInt32(optionKey | cmdKey),
                             id, GetApplicationEventTarget(), 0, &ref)
     }
@@ -533,6 +567,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let startupRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 60
     private var startupRecoveryPID: pid_t?
     private var reconnectVerification: (pid: pid_t, position: CGPoint, deadline: Double)?
+    private var explicitRescue = ExplicitCursorRescue()
+    private var lastRescueResult: Int32?
+    private var lastRescuePID: pid_t?
+    private var gameTicks = 0
+    private var physicalMotionEvents = 0
+    private var lastDiagnosticsWrite = -Double.infinity
+    private let diagnosticsURL: URL? = {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--diagnostics-output"),
+              arguments.indices.contains(index + 1) else { return nil }
+        return URL(fileURLWithPath: arguments[index + 1])
+    }()
 
     private func noteRestore(flash: Bool = true) {
         restoreCount += 1
@@ -571,6 +617,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey = Hotkey { [weak self] in
             self?.requestPointerRecovery()
         }
+        if CommandLine.arguments.contains("--rescue-cursor-now") {
+            requestPointerRecovery()
+        }
+        writeDiagnostics(force: true)
     }
 
     private func attemptRestore(manual: Bool = false) {
@@ -591,12 +641,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestPointerRecovery() {
-        guard settings.enabled, CursorFixer.frontmostIsTarget() else { return }
-        recovery.requestReconnect()
-        attemptRestore(manual: true)
+        explicitRescue.request(now: ProcessInfo.processInfo.systemUptime)
+        writeDiagnostics(force: true)
+    }
+
+    private func serviceExplicitRescue(now: Double) {
+        guard explicitRescue.pending else { return }
+        let previousState = explicitRescue.state
+        let result = explicitRescue.service(
+            frontPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            eventButtons: NSEvent.pressedMouseButtons,
+            hidButtons: CursorFixer.buttonMask(.hidSystemState),
+            sessionButtons: CursorFixer.buttonMask(.combinedSessionState), now: now
+        ) { pid in
+            let (outcome, error) = CursorFixer.rescueCursorNow(expectedPID: pid)
+            if let error {
+                lastRescueResult = error
+                lastRescuePID = pid
+            }
+            return outcome
+        }
+        if result == .succeeded { noteRestore() }
+        if explicitRescue.state != previousState { writeDiagnostics(force: true) }
+    }
+
+    /// Overwrite one bounded local snapshot; never record coordinates or input text.
+    private func writeDiagnostics(force: Bool = false) {
+        guard let diagnosticsURL else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - lastDiagnosticsWrite >= 1 else { return }
+        lastDiagnosticsWrite = now
+        let front = NSWorkspace.shared.frontmostApplication
+        let frontPID = front?.processIdentifier
+        var snapshot: [String: Any] = [
+            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            "process_id": ProcessInfo.processInfo.processIdentifier,
+            "uptime_seconds": now,
+            "timer_ticks": gameTicks,
+            "enabled": settings.enabled,
+            "frontmost_pid": frontPID.map { Int($0) } ?? -1,
+            "frontmost_name": front?.localizedName ?? "none",
+            "frontmost_is_target": CursorFixer.frontmostIsTarget(),
+            "event_buttons": NSEvent.pressedMouseButtons,
+            "hid_buttons": CursorFixer.buttonMask(.hidSystemState),
+            "session_buttons": CursorFixer.buttonMask(.combinedSessionState),
+            "motion_monitor_installed": globalMouseMonitor != nil,
+            "physical_motion_events": physicalMotionEvents,
+            "hotkey_handler_status": hotkey?.handlerStatus ?? -1,
+            "hotkey_registration_status": hotkey?.registrationStatus ?? -1,
+            "explicit_rescue_pending": explicitRescue.pending,
+            "explicit_rescue_state": explicitRescue.state,
+            "explicit_rescue_attempts": explicitRescue.attempts,
+            "legacy_target_request_pending": startupReconnectRequested
+        ]
+        if let lastRescueResult { snapshot["last_association_error"] = lastRescueResult }
+        if let lastRescuePID { snapshot["last_rescue_pid"] = lastRescuePID }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: diagnosticsURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: diagnosticsURL.path)
+        } catch {
+            NSLog("KeepCursor diagnostic snapshot write failed")
+        }
     }
 
     private func observePhysicalMotion(_ event: NSEvent) {
+        physicalMotionEvents += 1
         guard settings.enabled, CursorFixer.frontmostIsTarget() else { return }
         let mouse = NSEvent.mouseLocation
         let moved = mouse != lastNativePosition
@@ -621,6 +731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func gameTick() {
+        gameTicks += 1
         let isTarget = CursorFixer.frontmostIsTarget()
         let buttons = NSEvent.pressedMouseButtons
         let now = ProcessInfo.processInfo.systemUptime
@@ -644,6 +755,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         )
 
+        serviceExplicitRescue(now: now)
+        writeDiagnostics()
         let targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         if startupReconnectRequested,
            now > startupRecoveryDeadline || (startupRecoveryPID != nil && startupRecoveryPID != targetPID) {

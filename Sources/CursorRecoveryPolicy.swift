@@ -5,6 +5,70 @@ enum CursorReconnectResult {
     case deferred, succeeded, failed
 }
 
+/// A user-requested rescue is independent of automatic game recovery. It waits
+/// for a stable foreground application and released physical/session buttons.
+struct ExplicitCursorRescue {
+    private(set) var pending = false
+    private(set) var state = "idle"
+    private(set) var attempts = 0
+    private var expiresAt = 0.0
+    private var frontPID: Int32?
+    private var frontSince = 0.0
+    private var releasedSince: Double?
+
+    mutating func request(now: Double) {
+        pending = true
+        state = "requested"
+        expiresAt = now + 60
+        frontPID = nil
+        releasedSince = nil
+    }
+
+    mutating func service(frontPID currentPID: Int32?, eventButtons: Int,
+                          hidButtons: UInt64, sessionButtons: UInt64, now: Double,
+                          rescue: (Int32) -> CursorReconnectResult) -> CursorReconnectResult? {
+        guard pending else { return nil }
+        guard now <= expiresAt else {
+            pending = false
+            state = "expired"
+            return nil
+        }
+        guard let currentPID else {
+            frontPID = nil
+            releasedSince = nil
+            state = "waiting_for_foreground"
+            return nil
+        }
+        if frontPID != currentPID {
+            frontPID = currentPID
+            frontSince = now
+            releasedSince = nil
+        }
+        guard eventButtons == 0, hidButtons == 0, sessionButtons == 0 else {
+            releasedSince = nil
+            state = "waiting_for_button_release"
+            return nil
+        }
+        if releasedSince == nil { releasedSince = now }
+        guard now - frontSince >= 0.25,
+              now - (releasedSince ?? now) >= 0.25 else {
+            state = "waiting_for_stable_release"
+            return nil
+        }
+        let result = rescue(currentPID)
+        if result == .deferred {
+            releasedSince = nil
+            frontSince = now
+            state = "deferred_by_live_input_check"
+        } else {
+            attempts += 1
+            pending = false
+            state = result == .succeeded ? "api_accepted" : "api_rejected"
+        }
+        return result
+    }
+}
+
 struct CursorRecoveryPolicy {
     static let releaseGracePeriod = 0.25
     static let recoveryInterval = 1.0

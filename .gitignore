@@ -10,3 +10,6 @@ secrets.json
 CREDENTIALS.md
 *.p8
 *.p12
+
+# Private runtime snapshots
+*-diagnostics.json
