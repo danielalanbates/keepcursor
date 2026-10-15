@@ -1,8 +1,8 @@
 # Current update — 2026-10-15
 
-2.3.0b1 supersedes the historical implementation notes below. The cursor visibility goal remains active; recovery now uses visibility APIs and a native-position fallback only. Relative mouse capture and actual click coordinates remain controlled by the game. The previous watchdog and mouse-release warps interfered with WoW input.
+2.3.0b2 supersedes the historical implementation notes below. The cursor visibility goal remains active. The first visibility-only beta did not repair Daniel's frozen in-game pointer. The current beta adds a single explicit reconnect and a passive physical-motion stall detector, guarded by focus, released-button settling, per-episode consumption, and a minimum retry interval. It keeps visibility repair and a native-position fallback. The previous continuous watchdog and mouse-release warps interfered with WoW input.
 
-See `README.md`, `Sources/CursorRecoveryPolicy.swift`, and `TEST_PLAN.md` for the current design, regression checks, limitations, live verification gate, and next investigation paths. The local beta is compiled and signature verified; no new public release was made because live WoW checks remain pending. Retired source is preserved in Git history at `7815333`.
+See `README.md`, `Sources/CursorRecoveryPolicy.swift`, and `TEST_PLAN.md` for the current design, regression checks, limitations, live verification gate, and next investigation paths. The local beta is compiled, policy tested, independently reviewed, and signature verified. Actual API acceptance and live WoW pointer/button behavior require verification; foreground restrictions may prevent a background helper from repairing game capture. No new public release was made because live WoW checks remain pending. Retired source is preserved in Git history at `7815333`.
 
 ---
 

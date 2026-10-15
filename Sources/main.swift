@@ -2,9 +2,9 @@
 // All rights reserved. Copyright (c) 2026 Bates LLC / Daniel Bates.
 //
 // WoW owns relative mouse capture, button state, and cursor position. KeepCursor
-// only restores visibility after mouse buttons have settled, and displays a
-// click-through fallback at the real cursor position. It never moves the cursor
-// or reconnects the mouse while a game may be using relative input.
+// restores visibility after mouse buttons have settled and displays a fallback
+// at the real click position. A reconnect is a single explicit repair or requires
+// evidence of physical movement with a stalled native pointer. It never warps.
 
 import AppKit
 import CoreGraphics
@@ -215,6 +215,22 @@ enum CursorFixer {
             return apps.first(where: { looksLikeFullscreenGame($0) })
         }
         return nil
+    }
+
+    /// Single input reconnect after an explicit request or verified pointer stall.
+    /// This final live guard is essential even when a delayed policy approved it.
+    static func reconnectMouse(expectedPID: pid_t?) -> CursorReconnectResult {
+        guard let expectedPID, Settings.shared.enabled, frontmostIsTarget(),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+              NSEvent.pressedMouseButtons == 0 else { return .deferred }
+        let result = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        NSLog("KeepCursor one-shot reconnect result: %d", result.rawValue)
+        if result != .success {
+            NSLog("KeepCursor one-shot reconnect failed: %d", result.rawValue)
+            return .failed
+        }
+        _ = restoreVisibility()
+        return .succeeded
     }
 
     /// Restore visibility only. WoW retains ownership of mouse capture and position.
@@ -511,6 +527,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recovery = CursorRecoveryPolicy()
     private var restoreCount = 0
     private var activationGeneration = 0
+    private var globalMouseMonitor: Any?
+    private var lastNativePosition = NSEvent.mouseLocation
+    private var startupReconnectRequested = CommandLine.arguments.contains("--recover-pointer-once")
+    private let startupRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 60
+    private var startupRecoveryPID: pid_t?
+    private var reconnectVerification: (pid: pid_t, position: CGPoint, deadline: Double)?
 
     private func noteRestore(flash: Bool = true) {
         restoreCount += 1
@@ -534,13 +556,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }, nil)
 
+        // Passive evidence for a frozen pointer. Events pass through to the game.
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [
+            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged
+        ]) { [weak self] event in
+            self?.observePhysicalMotion(event)
+        }
+
         // The timer observes mouse position/buttons; it never posts input events.
         gameLoopTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
             self?.gameTick()
         }
 
         hotkey = Hotkey { [weak self] in
-            self?.attemptRestore(manual: true)
+            self?.requestPointerRecovery()
         }
     }
 
@@ -561,10 +590,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func requestPointerRecovery() {
+        guard settings.enabled, CursorFixer.frontmostIsTarget() else { return }
+        recovery.requestReconnect()
+        attemptRestore(manual: true)
+    }
+
+    private func observePhysicalMotion(_ event: NSEvent) {
+        guard settings.enabled, CursorFixer.frontmostIsTarget() else { return }
+        let mouse = NSEvent.mouseLocation
+        let moved = mouse != lastNativePosition
+        lastNativePosition = mouse
+        if let verification = reconnectVerification,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier == verification.pid,
+           NSEvent.pressedMouseButtons == 0, moved, mouse != verification.position {
+            NSLog("KeepCursor native pointer movement observed after reconnect")
+            reconnectVerification = nil
+        }
+        // A normal screen-edge clamp is not a stalled game pointer.
+        let atEdge = NSScreen.screens.contains { screen in
+            let frame = screen.frame
+            return frame.insetBy(dx: -1, dy: -1).contains(mouse)
+                && (abs(mouse.x - frame.minX) <= 1 || abs(mouse.x - frame.maxX) <= 1
+                    || abs(mouse.y - frame.minY) <= 1 || abs(mouse.y - frame.maxY) <= 1)
+        }
+        recovery.recordMotion(cursorMoved: moved,
+                              deltaDistance: hypot(event.deltaX, event.deltaY),
+                              atScreenEdge: atEdge, buttons: NSEvent.pressedMouseButtons,
+                              now: ProcessInfo.processInfo.systemUptime)
+    }
+
     private func gameTick() {
         let isTarget = CursorFixer.frontmostIsTarget()
         let buttons = NSEvent.pressedMouseButtons
-        recovery.observe(buttons: buttons, now: ProcessInfo.processInfo.systemUptime)
+        let now = ProcessInfo.processInfo.systemUptime
+        recovery.observe(buttons: buttons, now: now)
+        let mouse = NSEvent.mouseLocation
+        if mouse != lastNativePosition {
+            recovery.nativePointerMoved()
+            lastNativePosition = mouse
+        }
 
         // Show the fallback at the actual click location. A separate virtual
         // pointer would imply clicks land somewhere WoW cannot receive them.
@@ -579,7 +644,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         )
 
+        let targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if startupReconnectRequested,
+           now > startupRecoveryDeadline || (startupRecoveryPID != nil && startupRecoveryPID != targetPID) {
+            startupReconnectRequested = false
+            startupRecoveryPID = nil
+            recovery.cancelReconnectRequest()
+        }
+        if let verification = reconnectVerification,
+           now > verification.deadline || targetPID != verification.pid {
+            NSLog("KeepCursor reconnect movement not verified before timeout or focus change")
+            reconnectVerification = nil
+        }
         guard settings.enabled, isTarget else { return }
+        if startupReconnectRequested {
+            if startupRecoveryPID == nil { startupRecoveryPID = targetPID }
+            recovery.requestReconnect()
+        }
+        if recovery.attemptReconnect(enabled: settings.enabled, isTarget: isTarget,
+                                     buttons: buttons, now: now, reconnect: {
+            let result = CursorFixer.reconnectMouse(expectedPID: targetPID)
+            if result != .deferred {
+                startupReconnectRequested = false
+                startupRecoveryPID = nil
+            }
+            if result == .succeeded, let targetPID {
+                reconnectVerification = (targetPID, NSEvent.mouseLocation, now + 10)
+            }
+            return result
+        }) {
+            noteRestore(flash: false)
+        }
         // Repair a missing native cursor only after release has settled. Visibility
         // repairs are limited to once per second, without association or warps.
         attemptRestore()
@@ -743,7 +838,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
                 as? NSRunningApplication,
               CursorFixer.isWoW(app)
-                || (settings.watchAllGames && CursorFixer.looksLikeFullscreenGame(app)) else { return }
+                || (settings.watchAllGames && CursorFixer.looksLikeFullscreenGame(app)) else {
+            // An unbound startup request waits for the first game focus. Once
+            // bound, leaving that target cancels it before any cursor API call.
+            if startupRecoveryPID != nil {
+                startupReconnectRequested = false
+                startupRecoveryPID = nil
+            }
+            return
+        }
+        if let boundPID = startupRecoveryPID, boundPID != app.processIdentifier {
+            startupReconnectRequested = false
+            startupRecoveryPID = nil
+        }
 
         let generation = activationGeneration
         let targetPID = app.processIdentifier
@@ -762,6 +869,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.enabled.toggle()
         activationGeneration += 1
         recovery.reset()
+        startupReconnectRequested = false
+        startupRecoveryPID = nil
         if !settings.enabled { CursorOverlayController.shared.hide() }
         rebuildMenu()
     }
@@ -797,7 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restoreNow() {
-        attemptRestore(manual: true)
+        requestPointerRecovery()
     }
 
     @objc private func openSite() {
