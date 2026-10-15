@@ -1,45 +1,35 @@
-# KeepCursor 2.2.0 — Live WoW Verification Plan
+# KeepCursor 2.3.0b1 verification
 
-The 2.2.0 restore counter makes efficacy visible: the menu's status line now
-shows `restored N×` every time a real restore fires.
+## Completed without GUI control
 
-## Setup
-1. Launch KeepCursor 2.2.0 (menu bar icon: cursor with rays).
-2. Open the menu — status should read "Watching for WoW…", no counter yet.
-3. Launch World of Warcraft. Status should flip to "Active — WoW running".
+- [x] Optimized native Apple Silicon build succeeds with the Xcode command-line tools.
+- [x] Input safety policy regression executable passes: right/both/other-button holds, release settling, retry interval, visible cursor, pause, focus loss, manual restore, failed final input check, and overlay suppression.
+- [x] `codesign --verify --deep --strict` passes for the build and installed beta.
+- [x] Installed executable matches the validated build; previous app archived before replacement.
+- [x] Source review confirms no mouse association changes, warps, input posting, virtual pointer deltas, event taps, or global mouse monitors.
+- [x] Independent source review covers delayed callback cancellation, live input recheck, arrow hotspot, and appearance repainting.
 
-## Test 1 — alt-tab restore (the core fix)
-1. In WoW, Cmd-Tab to another app, then Cmd-Tab back to WoW.
-2. Expected: cursor visible immediately; menu status shows `restored 1×`
-   (each switch-back counts once).
+## Live WoW checks: pending
 
-## Test 2 — no jitter while playing (the 2.2.0 fix)
-1. Stay in WoW and play normally for 2–3 minutes, including sustained
-   right-button camera turns and aiming.
-2. Expected: NO cursor stutter or 1px hops. (2.1.0 warped the cursor every
-   second while WoW was frontmost; 2.2.0 only does silent maintenance unless
-   the cursor is actually lost, and never warps while a mouse button is held.)
-3. The counter should NOT climb while you simply play with a visible cursor.
+Use one KeepCursor instance. These are manual checks during normal play; do not automate game input or repeatedly launch the app.
 
-## Test 3 — in-game alert case (safety timer)
-1. Trigger anything that hides/steals the cursor without leaving WoW
-   (e.g. an OS notification popping over full-screen WoW).
-2. Expected: cursor returns within ~1 s and the counter increments.
+| Scenario | Expected behavior | Result |
+| --- | --- | --- |
+| Move the mouse with no buttons held | Fallback arrow follows the actual pointer; clicks land at its hotspot | Pending |
+| Hold right button and move | Camera turns normally; overlay hides; no pointer warp | Pending |
+| Hold left button, then both buttons | Normal game behavior and movement; overlay stays hidden | Pending |
+| Release both buttons | Normal game input returns immediately; overlay returns at actual pointer position | Pending |
+| Command-Tab away and back | Hidden native cursor receives a visibility-only repair after the release grace period | Pending |
+| Switch away before a delayed repair | No repair affects the other application | Pending |
+| Pause KeepCursor before a delayed repair | Fallback hides and repairs stop | Pending |
+| Option-Command-C | Repairs visibility only while target is frontmost, unpaused, with no held buttons | Pending |
+| Change style/color | Appearance repaints immediately, including when mouse buttons remain released | Pending |
+| Keep a saved ring preference | Existing preference remains selected; new installations default to arrow | Pending |
 
-## Test 4 — manual restore
-1. Press ⌥⌘C (or menu → Restore cursor now).
-2. Expected: icon flashes, counter increments.
+A hidden cursor is different from stuck game input capture. If the real pointer is frozen even after all buttons are released, this beta intentionally avoids reconnecting mouse input or inventing a separate click position. Switch away and back and release both buttons normally. Record such cases before considering further changes.
 
-## Test 5 — cursor size pinning
-1. Set the slider to 3.0×, launch/quit WoW (display-mode change).
-2. Expected: cursor size stays 3.0× after the game resets the display.
+## Release gate and future work
 
-## Pass criteria
-Tests 1, 2, 4 pass = ship. Test 3 is best-effort (depends on reproducing the
-alert). Record results here:
+Keep the installed `.app` as the local beta. Publish a notarized public release only after the live checks pass. Record macOS/WoW versions and observed results without private account data.
 
-- [ ] Test 1: 
-- [ ] Test 2: 
-- [ ] Test 3: 
-- [ ] Test 4: 
-- [ ] Test 5: 
+If visibility-only repair is insufficient, first collect read-only evidence of visibility, actual pointer movement, focus, and button state. Investigate a game-supported reset or user-requested recovery. Do not reintroduce periodic association changes, cursor warps, or synthetic button releases as an automatic watchdog.

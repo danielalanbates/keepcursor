@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build KeepCursor.app as a universal binary.
+# Build KeepCursor.app for the current Mac architecture.
 # The bundle is assembled OFF iCloud (in /tmp) because iCloud constantly re-adds
 # extended attributes that codesign rejects ("resource fork ... detritus").
 # Override the output dir with BUILD_DIR=...
@@ -15,11 +15,10 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "› Copying source off iCloud"
-SRC="$BUILD_DIR/main.swift"
-cp "$ROOT/Sources/main.swift" "$SRC"
+cp "$ROOT"/Sources/*.swift "$BUILD_DIR/"
 
 echo "› Compiling native binary"
-swiftc -O "$SRC" -o "$APP/Contents/MacOS/$NAME"
+swiftc -O "$BUILD_DIR"/*.swift -o "$APP/Contents/MacOS/$NAME"
 
 echo "› Installing Info.plist"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"

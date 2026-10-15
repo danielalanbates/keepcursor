@@ -2,3 +2,11 @@ build/
 dist/
 *.zip
 .DS_Store
+
+# Private local configuration and signing material
+.env
+.env.*
+secrets.json
+CREDENTIALS.md
+*.p8
+*.p12

@@ -1,36 +1,10 @@
-// KeepCursor — keeps the macOS mouse cursor visible in World of Warcraft
-// (and other full-screen games) both during gameplay and after Command-Tab / alt-tab.
+// KeepCursor — cursor visibility recovery without changing game mouse input.
+// All rights reserved. Copyright (c) 2026 Bates LLC / Daniel Bates.
 //
-// THE PROBLEMS IN WORLD OF WARCRAFT ON MACOS:
-//   1. CAMERA STEERING / BUTTON HOLDS:
-//      When holding Right Mouse Button (to steer/turn) or Left Mouse Button (to look),
-//      WoW deliberately hides the cursor and calls CGAssociateMouseAndMouseCursorPosition(0).
-//      On macOS, releasing the button often fails to restore the cursor due to WindowServer bugs,
-//      and during the hold, NSEvent.mouseLocation stays frozen even as the trackpad moves.
-//   2. ALT-TAB / WINDOW SWITCHING:
-//      Switching out of WoW and back can drive the WindowServer cursor hide counter
-//      negative and decouple the mouse association.
-//   3. HARDWARE CURSOR REPAINT:
-//      The hardware cursor sprite is not repainted until a hardware event nudges it.
-//
-// THE KEEPCURSOR SOLUTIONS:
-//   A. ALWAYS-VISIBLE CURSOR OVERLAY (Active during gameplay):
-//      A zero-latency, click-through, floating overlay window at screenSaver level
-//      that smoothly tracks the mouse position. In camera-steering/relative mode,
-//      physical delta events (deltaX, deltaY) continue to drive the overlay in real-time
-//      so the circle NEVER gets stuck in one place.
-//   B. INSTANT RESTORE & WARP ON BUTTON / DRAG RELEASE:
-//      When steering or dragging ends, warps cursor to the overlay coordinate, unwinds
-//      the hide counter, calls CGSForceShowCursor via SkyLight, and re-associates mouse position.
-//   C. CONTINUOUS IDLE WATCHDOG:
-//      Whenever buttons == 0 (not steering), actively ensures CGAssociateMouseAndMouseCursorPosition(1)
-//      and checks CGCursorIsVisible(). If hidden, restores the cursor immediately.
-//   D. RESTORE BURST ON APP ACTIVATION:
-//      Fires immediately when alt-tabbing back into WoW.
-//   E. CURSOR SIZE PINNING (SkyLight CGSSetCursorScale):
-//      Prevents WoW's display-mode switches from resetting your cursor size.
-//
-// Zero special permissions required. Fully self-contained.
+// WoW owns relative mouse capture, button state, and cursor position. KeepCursor
+// only restores visibility after mouse buttons have settled, and displays a
+// click-through fallback at the real cursor position. It never moves the cursor
+// or reconnects the mouse while a game may be using relative input.
 
 import AppKit
 import CoreGraphics
@@ -60,7 +34,7 @@ final class Settings {
             Keys.keepSize: true,
             Keys.cursorScale: 2.0,
             Keys.alwaysVisibleOverlay: true,
-            Keys.overlayStyle: "ring",
+            Keys.overlayStyle: "arrow",
             Keys.overlayColor: "gold",
         ])
     }
@@ -85,7 +59,7 @@ final class Settings {
         set { d.set(newValue, forKey: Keys.alwaysVisibleOverlay) }
     }
     var overlayStyle: String {
-        get { d.string(forKey: Keys.overlayStyle) ?? "ring" }
+        get { d.string(forKey: Keys.overlayStyle) ?? "arrow" }
         set { d.set(newValue, forKey: Keys.overlayStyle) }
     }
     var overlayColor: String {
@@ -166,12 +140,15 @@ enum SkyLightCursor {
 enum CursorFixer {
     private typealias CursorVisibleFn = @convention(c) () -> boolean_t
     private static let cursorVisibleFn: CursorVisibleFn? = {
-        guard let sym = dlsym(dlopen(nil, RTLD_NOW), "CGCursorIsVisible") else { return nil }
-        return unsafeBitCast(sym, to: CursorVisibleFn.self)
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let symbol = dlsym(handle, "CGCursorIsVisible") else { return nil }
+        return unsafeBitCast(symbol, to: CursorVisibleFn.self)
     }()
 
     static func isCursorVisible() -> Bool {
-        return cursorVisibleFn?() != 0
+        // If the private visibility query disappears, avoid repeated forced repairs.
+        guard let cursorVisibleFn else { return true }
+        return cursorVisibleFn() != 0
     }
 
     static func isWoW(_ app: NSRunningApplication) -> Bool {
@@ -240,34 +217,18 @@ enum CursorFixer {
         return nil
     }
 
-    /// Core cursor restoration.
-    /// Safely unhides WindowServer cursor, re-links mouse, and nudges 1px to repaint.
-    static func restoreBurst(includeWarp: Bool = true) {
-        // 1. Force WindowServer to show cursor
+    /// Restore visibility only. WoW retains ownership of mouse capture and position.
+    /// Recheck live input here as well as in the polling policy: delayed requests
+    /// may run after the user starts a camera turn or switches to another app.
+    @discardableResult
+    static func restoreVisibility() -> Bool {
+        guard frontmostIsTarget(), NSEvent.pressedMouseButtons == 0 else { return false }
         SkyLightCursor.forceShow()
-
-        // 2. Unwind negative hide counter on the display
         let display = CGMainDisplayID()
         for _ in 0..<8 { CGDisplayShowCursor(display) }
-
-        // 3. Re-associate mouse and cursor position
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-
-        guard includeWarp, NSEvent.pressedMouseButtons == 0 else { return }
-
-        // 4. Force hardware cursor repaint by nudging 1px and back
-        let loc = currentCursorLocationCG()
-        let nudged = CGPoint(x: loc.x + 1, y: loc.y)
-        CGWarpMouseCursorPosition(nudged)
-        CGWarpMouseCursorPosition(loc)
+        return true
     }
 
-    /// Cursor location in CoreGraphics (top-left origin) coordinates.
-    static func currentCursorLocationCG() -> CGPoint {
-        let mouse = NSEvent.mouseLocation // bottom-left origin
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        return CGPoint(x: mouse.x, y: screenHeight - mouse.y)
-    }
 }
 
 // MARK: - Always-Visible Cursor Overlay View & Window
@@ -420,9 +381,12 @@ final class CursorOverlayController {
             return
         }
 
-        overlayView.style = Settings.shared.overlayStyle
-        overlayView.colorName = Settings.shared.overlayColor
-        if overlayView.isPressed != isPressed {
+        let style = Settings.shared.overlayStyle
+        let color = Settings.shared.overlayColor
+        if overlayView.style != style || overlayView.colorName != color
+            || overlayView.isPressed != isPressed {
+            overlayView.style = style
+            overlayView.colorName = color
             overlayView.isPressed = isPressed
             overlayView.needsDisplay = true
         }
@@ -544,13 +508,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkey: Hotkey?
     private let settings = Settings.shared
 
-    private var lastButtons: Int = 0
+    private var recovery = CursorRecoveryPolicy()
     private var restoreCount = 0
-
-    // Virtual cursor position that tracks trackpad deltas even during mouselook / relative mode
-    private var virtualPos: CGPoint = .zero
-    private var lastMouseLoc: CGPoint = .zero
-    private var globalMouseMonitor: Any?
+    private var activationGeneration = 0
 
     private func noteRestore(flash: Bool = true) {
         restoreCount += 1
@@ -560,9 +520,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         setupStatusItem()
-
-        virtualPos = NSEvent.mouseLocation
-        lastMouseLoc = virtualPos
 
         // 1. App-activation notification: instant burst on Cmd-Tab back to WoW
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -577,130 +534,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }, nil)
 
-        // 3. Global Mouse Event Monitor:
-        //    Tracks physical trackpad/mouse delta events even when WoW disassociates
-        //    mouse position (CGAssociateMouseAndMouseCursorPosition(0)).
-        //    Ensures the circle overlay follows the user's hand, and restores the cursor
-        //    immediately on release.
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [
-            .mouseMoved,
-            .leftMouseDragged,
-            .rightMouseDragged,
-            .otherMouseDragged,
-            .leftMouseUp,
-            .rightMouseUp,
-            .otherMouseUp
-        ]) { [weak self] event in
-            self?.handleGlobalMouseEvent(event)
-        }
-
-        // 4. Fast 60Hz gameplay loop:
-        //    - Smoothly positions the Always-Visible Overlay
-        //    - Enforces cursor association and visibility watchdog
-        //    - Detects button release transitions in real time
+        // The timer observes mouse position/buttons; it never posts input events.
         gameLoopTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
             self?.gameTick()
         }
 
         hotkey = Hotkey { [weak self] in
-            CursorFixer.restoreBurst(includeWarp: true)
-            self?.noteRestore()
+            self?.attemptRestore(manual: true)
         }
     }
 
-    private func handleGlobalMouseEvent(_ event: NSEvent) {
-        guard settings.enabled else { return }
-        let isTarget = CursorFixer.frontmostIsTarget()
-        guard isTarget else { return }
-
-        let currentMouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 2560, height: 1600)
-
-        // If system mouseLocation is moving normally, keep virtualPos locked to it
-        if currentMouse != lastMouseLoc {
-            virtualPos = currentMouse
-            lastMouseLoc = currentMouse
-        } else if event.deltaX != 0 || event.deltaY != 0 {
-            // System mouse is stationary / disassociated by WoW (camera turn/steering)!
-            // Accumulate physical trackpad deltas so the circle tracks the user's trackpad movement
-            virtualPos.x += event.deltaX
-            virtualPos.y -= event.deltaY // Cocoa Y is inverted vs screen deltas
-            virtualPos.x = max(0, min(screen.width, virtualPos.x))
-            virtualPos.y = max(0, min(screen.height, virtualPos.y))
-        }
-
-        // Detect any mouse button release
-        if event.type == .leftMouseUp || event.type == .rightMouseUp || event.type == .otherMouseUp {
-            // Button released! Warp hardware cursor to where the user aimed the circle
-            let cgY = screen.height - virtualPos.y
-            CGWarpMouseCursorPosition(CGPoint(x: virtualPos.x, y: cgY))
-            CursorFixer.restoreBurst(includeWarp: false)
-            noteRestore(flash: false)
-        }
-
-        if settings.alwaysVisibleOverlay {
-            CursorOverlayController.shared.update(
-                mouseLocation: virtualPos,
-                isPressed: NSEvent.pressedMouseButtons != 0,
-                shouldShow: true
-            )
+    private func attemptRestore(manual: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let buttons = NSEvent.pressedMouseButtons
+        recovery.observe(buttons: buttons, now: now)
+        if recovery.attemptRestore(
+            enabled: settings.enabled,
+            isTarget: CursorFixer.frontmostIsTarget(),
+            buttons: buttons,
+            cursorVisible: CursorFixer.isCursorVisible(),
+            now: now,
+            manual: manual,
+            restore: { CursorFixer.restoreVisibility() }
+        ) {
+            noteRestore(flash: manual)
         }
     }
 
     private func gameTick() {
-        guard settings.enabled else {
-            CursorOverlayController.shared.hide()
-            return
-        }
-
         let isTarget = CursorFixer.frontmostIsTarget()
-        let mouse = NSEvent.mouseLocation
         let buttons = NSEvent.pressedMouseButtons
+        recovery.observe(buttons: buttons, now: ProcessInfo.processInfo.systemUptime)
 
-        if isTarget {
-            let screen = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 2560, height: 1600)
-
-            // Sync with hardware position if it changed
-            if mouse != lastMouseLoc {
-                virtualPos = mouse
-                lastMouseLoc = mouse
-            }
-
-            // Update the Always-Visible Cursor Overlay
-            let showOverlay = settings.alwaysVisibleOverlay
-            CursorOverlayController.shared.update(
-                mouseLocation: virtualPos,
-                isPressed: buttons != 0,
-                shouldShow: showOverlay
+        // Show the fallback at the actual click location. A separate virtual
+        // pointer would imply clicks land somewhere WoW cannot receive them.
+        CursorOverlayController.shared.update(
+            mouseLocation: NSEvent.mouseLocation,
+            isPressed: false,
+            shouldShow: CursorRecoveryPolicy.shouldShowOverlay(
+                enabled: settings.enabled,
+                isTarget: isTarget,
+                overlayEnabled: settings.alwaysVisibleOverlay,
+                buttons: buttons
             )
+        )
 
-            // Detect mouse button release transition
-            if lastButtons != 0 && buttons == 0 {
-                let cgY = screen.height - virtualPos.y
-                CGWarpMouseCursorPosition(CGPoint(x: virtualPos.x, y: cgY))
-                CursorFixer.restoreBurst(includeWarp: false)
-                noteRestore(flash: false)
-            }
-
-            // IDLE WATCHDOG: When no buttons are held (idle navigation / moving trackpad without click)
-            if buttons == 0 {
-                // Ensure mouse position is NEVER disassociated while idle
-                CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-
-                // If hardware cursor is hidden by WoW, restore it immediately
-                if !CursorFixer.isCursorVisible() {
-                    CursorFixer.restoreBurst(includeWarp: false)
-                }
-            }
-
-            if settings.keepSize {
-                SkyLightCursor.enforceScale(Float(settings.cursorScale))
-            }
-        } else {
-            CursorOverlayController.shared.hide()
+        guard settings.enabled, isTarget else { return }
+        // Repair a missing native cursor only after release has settled. Visibility
+        // repairs are limited to once per second, without association or warps.
+        attemptRestore()
+        if settings.keepSize, buttons == 0 {
+            SkyLightCursor.enforceScale(Float(settings.cursorScale))
         }
-
-        lastButtons = buttons
     }
 
     private func setupStatusItem() {
@@ -725,16 +610,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.menu = nil
         } else {
             restoreNow()
-        }
-    }
-
-    private func returnFocusToGame() {
-        guard let game = CursorFixer.targetApp() else { return }
-        game.activate(options: [])
-        for delay in [0.15, 0.4] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                CursorFixer.restoreBurst(includeWarp: true)
-            }
         }
     }
 
@@ -764,8 +639,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Overlay Style Submenu
         let styleMenu = NSMenu()
         let styles: [(id: String, name: String)] = [
-            ("ring", "Combat Reticle (WoW Style - Recommended)"),
-            ("arrow", "Classic Pointer"),
+            ("ring", "Combat Reticle"),
+            ("arrow", "Classic Pointer (Recommended)"),
             ("dot", "Precision Dot")
         ]
         for s in styles {
@@ -861,23 +736,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Actions
 
     @objc private func appActivated(_ note: Notification) {
-        guard settings.enabled else { return }
-        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
-                as? NSRunningApplication else { return }
-        let isTarget = CursorFixer.isWoW(app)
-            || (settings.watchAllGames && CursorFixer.looksLikeFullscreenGame(app))
-        guard isTarget else { return }
+        activationGeneration += 1
+        recovery.reset()
+        CursorOverlayController.shared.hide()
+        guard settings.enabled,
+              let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
+                as? NSRunningApplication,
+              CursorFixer.isWoW(app)
+                || (settings.watchAllGames && CursorFixer.looksLikeFullscreenGame(app)) else { return }
 
-        for delay in [0.0, 0.15, 0.4, 0.8] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                CursorFixer.restoreBurst(includeWarp: true)
+        let generation = activationGeneration
+        let targetPID = app.processIdentifier
+        for delay in [0.3, 0.6, 0.9] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      self.activationGeneration == generation,
+                      self.settings.enabled,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else { return }
+                self.attemptRestore()
             }
         }
-        noteRestore(flash: false)
     }
 
     @objc private func toggleEnabled() {
         settings.enabled.toggle()
+        activationGeneration += 1
+        recovery.reset()
+        if !settings.enabled { CursorOverlayController.shared.hide() }
         rebuildMenu()
     }
 
@@ -912,9 +797,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restoreNow() {
-        CursorFixer.restoreBurst(includeWarp: true)
-        noteRestore()
-        returnFocusToGame()
+        attemptRestore(manual: true)
     }
 
     @objc private func openSite() {
