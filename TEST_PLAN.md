@@ -37,6 +37,21 @@ Use one KeepCursor instance. These are manual checks during normal play; do not 
 
 A hidden cursor is different from stuck game input capture. The beta has separate visibility-only recovery and a guarded one-shot reconnect. A native API return code of success is acceptance of the request, not proof that WoW input recovered. Verify actual pointer movement and clicks. Apple's APIs may reject or ignore an accessory helper's background reconnect, and passive monitors may receive no events in some game raw-input modes. If input remains stuck, switch away and back and release both buttons normally; record the result. A separate virtual pointer must not imply that game clicks land at invented coordinates.
 
+## Manual fallback: community-reported WoW camera reset
+
+[Blizzard forum source](https://eu.forums.blizzard.com/en/wow/t/mac-os-mojave-wow-freezing-when-alt-tab/3249/8). The report describes an in-game mouse-look reset; its effectiveness is **unverified in this session**.
+
+1. Focus WoW and release every mouse button.
+2. Press **Enter**, paste the following into chat, and press **Enter** once:
+
+   ```lua
+   /run if not IsMouseButtonDown() then MouselookStart() C_Timer.After(0, function() MouselookStop() end) end
+   ```
+
+3. Check actual pointer movement, clicking, and normal camera controls. Record the game version and result without private account data.
+
+Result: **Pending**. Execute this fallback manually. An optional companion addon is a future path only if this test establishes that the reset helps; keybindings and automated input are outside this change.
+
 ## Release gate and future work
 
 Keep the installed `.app` as the local beta. Publish a notarized public release only after the live checks pass. Record macOS/WoW versions and observed results without private account data.

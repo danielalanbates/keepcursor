@@ -29,6 +29,18 @@ Recovery is best effort: Apple's cursor APIs are documented for foreground calle
 
 The local beta has passed compilation, signature verification, and input safety regression tests. Live WoW verification is pending; see [TEST_PLAN.md](TEST_PLAN.md). It has not been published as a public release or notarized.
 
+## Manual WoW camera reset
+
+A [community report on Blizzard's forum](https://eu.forums.blizzard.com/en/wow/t/mac-os-mojave-wow-freezing-when-alt-tab/3249/8) describes resetting in-game mouse look when an external cursor helper is insufficient. This workaround is community-reported and **unverified in this session**.
+
+With WoW focused and all mouse buttons released, press **Enter**, paste this command into chat, then press **Enter**:
+
+```lua
+/run if not IsMouseButtonDown() then MouselookStart() C_Timer.After(0, function() MouselookStop() end) end
+```
+
+Try pointer movement, a normal click, and camera turning, and record the result. This is a manual fallback. Consider an optional companion addon only if the manual reset proves useful; retain user control over when it runs.
+
 ## Controls
 
 | Action | Control |
