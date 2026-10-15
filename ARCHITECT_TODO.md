@@ -1,3 +1,11 @@
+# Current update — 2026-10-15
+
+2.3.0b3 supersedes the historical implementation notes below. The cursor visibility goal remains active. The first visibility-only beta did not repair Daniel's frozen in-game pointer. The current beta retains game-scoped automatic recovery and adds an explicit any-foreground rescue, because a running background WoW process does not match the actual foreground application. The explicit path waits for stable foreground PID and released AppKit/HID/session buttons, attempts once even on API error, and writes bounded local diagnostics when requested. The passive physical-motion stall detector remains game-scoped, guarded by focus, released-button settling, per-episode consumption, and a minimum retry interval. It keeps visibility repair and a native-position fallback. The previous continuous watchdog and mouse-release warps interfered with WoW input.
+
+See `README.md`, `Sources/CursorRecoveryPolicy.swift`, and `TEST_PLAN.md` for the current design, regression checks, limitations, live verification gate, and next investigation paths. The local beta is compiled, policy tested, independently reviewed, and signature verified. A runtime diagnostic snapshot confirmed one explicit reconnect accepted with return code0 while WoW was foreground and all button masks were released. Live WoW pointer/button recovery still requires verification; API acceptance is not proof that game capture recovered. No new public release was made because live WoW checks remain pending. Retired source is preserved in Git history at `7815333`.
+
+---
+
 # ARCHITECT_TODO — keep-cursor
 _Head Architect review 2026-07-02. Full context: `Code/_ARCHITECT_REVIEW_2026-07-02/`._
 _Worker rules: NEVER delete source code (only venv/node_modules/target/.build/__pycache__/dist and compiled artifacts). Move whole projects to `Code/Archived_Projects/<name>/` with WHY_ARCHIVED.md. Before moving a folder, run: grep -rl "keep-cursor" ~/Library/LaunchAgents/ "$HOME/Library/Application Support/BatesAI/" — if anything matches, STOP and report. Secrets (*.p8, *.p12, .env, keys) go to ~/Library/Application Support/BatesAI/keys/ chmod 600. Do ONE step at a time; verify; report._

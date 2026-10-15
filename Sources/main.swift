@@ -1,36 +1,10 @@
-// KeepCursor — keeps the macOS mouse cursor visible in World of Warcraft
-// (and other full-screen games) both during gameplay and after Command-Tab / alt-tab.
+// KeepCursor — cursor visibility recovery without changing game mouse input.
+// All rights reserved. Copyright (c) 2026 Bates LLC / Daniel Bates.
 //
-// THE PROBLEMS IN WORLD OF WARCRAFT ON MACOS:
-//   1. CAMERA STEERING / BUTTON HOLDS:
-//      When holding Right Mouse Button (to steer/turn) or Left Mouse Button (to look),
-//      WoW deliberately hides the cursor and calls CGAssociateMouseAndMouseCursorPosition(0).
-//      On macOS, releasing the button often fails to restore the cursor due to WindowServer bugs,
-//      and during the hold, NSEvent.mouseLocation stays frozen even as the trackpad moves.
-//   2. ALT-TAB / WINDOW SWITCHING:
-//      Switching out of WoW and back can drive the WindowServer cursor hide counter
-//      negative and decouple the mouse association.
-//   3. HARDWARE CURSOR REPAINT:
-//      The hardware cursor sprite is not repainted until a hardware event nudges it.
-//
-// THE KEEPCURSOR SOLUTIONS:
-//   A. ALWAYS-VISIBLE CURSOR OVERLAY (Active during gameplay):
-//      A zero-latency, click-through, floating overlay window at screenSaver level
-//      that smoothly tracks the mouse position. In camera-steering/relative mode,
-//      physical delta events (deltaX, deltaY) continue to drive the overlay in real-time
-//      so the circle NEVER gets stuck in one place.
-//   B. INSTANT RESTORE & WARP ON BUTTON / DRAG RELEASE:
-//      When steering or dragging ends, warps cursor to the overlay coordinate, unwinds
-//      the hide counter, calls CGSForceShowCursor via SkyLight, and re-associates mouse position.
-//   C. CONTINUOUS IDLE WATCHDOG:
-//      Whenever buttons == 0 (not steering), actively ensures CGAssociateMouseAndMouseCursorPosition(1)
-//      and checks CGCursorIsVisible(). If hidden, restores the cursor immediately.
-//   D. RESTORE BURST ON APP ACTIVATION:
-//      Fires immediately when alt-tabbing back into WoW.
-//   E. CURSOR SIZE PINNING (SkyLight CGSSetCursorScale):
-//      Prevents WoW's display-mode switches from resetting your cursor size.
-//
-// Zero special permissions required. Fully self-contained.
+// WoW owns relative mouse capture, button state, and cursor position. KeepCursor
+// restores visibility after mouse buttons have settled and displays a fallback
+// at the real click position. A reconnect is a single explicit repair or requires
+// evidence of physical movement with a stalled native pointer. It never warps.
 
 import AppKit
 import CoreGraphics
@@ -60,7 +34,7 @@ final class Settings {
             Keys.keepSize: true,
             Keys.cursorScale: 2.0,
             Keys.alwaysVisibleOverlay: true,
-            Keys.overlayStyle: "ring",
+            Keys.overlayStyle: "arrow",
             Keys.overlayColor: "gold",
         ])
     }
@@ -85,7 +59,7 @@ final class Settings {
         set { d.set(newValue, forKey: Keys.alwaysVisibleOverlay) }
     }
     var overlayStyle: String {
-        get { d.string(forKey: Keys.overlayStyle) ?? "ring" }
+        get { d.string(forKey: Keys.overlayStyle) ?? "arrow" }
         set { d.set(newValue, forKey: Keys.overlayStyle) }
     }
     var overlayColor: String {
@@ -166,12 +140,15 @@ enum SkyLightCursor {
 enum CursorFixer {
     private typealias CursorVisibleFn = @convention(c) () -> boolean_t
     private static let cursorVisibleFn: CursorVisibleFn? = {
-        guard let sym = dlsym(dlopen(nil, RTLD_NOW), "CGCursorIsVisible") else { return nil }
-        return unsafeBitCast(sym, to: CursorVisibleFn.self)
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let symbol = dlsym(handle, "CGCursorIsVisible") else { return nil }
+        return unsafeBitCast(symbol, to: CursorVisibleFn.self)
     }()
 
     static func isCursorVisible() -> Bool {
-        return cursorVisibleFn?() != 0
+        // If the private visibility query disappears, avoid repeated forced repairs.
+        guard let cursorVisibleFn else { return true }
+        return cursorVisibleFn() != 0
     }
 
     static func isWoW(_ app: NSRunningApplication) -> Bool {
@@ -240,34 +217,66 @@ enum CursorFixer {
         return nil
     }
 
-    /// Core cursor restoration.
-    /// Safely unhides WindowServer cursor, re-links mouse, and nudges 1px to repaint.
-    static func restoreBurst(includeWarp: Bool = true) {
-        // 1. Force WindowServer to show cursor
-        SkyLightCursor.forceShow()
+    static func buttonMask(_ state: CGEventSourceStateID) -> UInt64 {
+        var mask: UInt64 = 0
+        for index in 0..<32 {
+            if let button = CGMouseButton(rawValue: UInt32(index)),
+               CGEventSource.buttonState(state, button: button) {
+                mask |= UInt64(1) << index
+            }
+        }
+        return mask
+    }
 
-        // 2. Unwind negative hide counter on the display
+    /// Explicit rescue may repair the current foreground app, including the
+    /// desktop. It never activates an app, posts input, or changes cursor position.
+    static func rescueCursorNow(expectedPID: pid_t) -> (CursorReconnectResult, Int32?) {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+              NSEvent.pressedMouseButtons == 0,
+              buttonMask(.hidSystemState) == 0,
+              buttonMask(.combinedSessionState) == 0 else { return (.deferred, nil) }
+        let result = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        NSLog("KeepCursor explicit foreground rescue result: %d", result.rawValue)
+        // Native visibility is a separate best-effort operation, even if the
+        // association API is rejected for this background helper.
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+           NSEvent.pressedMouseButtons == 0,
+           buttonMask(.hidSystemState) == 0,
+           buttonMask(.combinedSessionState) == 0 {
+            SkyLightCursor.forceShow()
+            for _ in 0..<8 { CGDisplayShowCursor(CGMainDisplayID()) }
+        }
+        return (result == .success ? .succeeded : .failed, result.rawValue)
+    }
+
+    /// Single input reconnect after an explicit request or verified pointer stall.
+    /// This final live guard is essential even when a delayed policy approved it.
+    static func reconnectMouse(expectedPID: pid_t?) -> CursorReconnectResult {
+        guard let expectedPID, Settings.shared.enabled, frontmostIsTarget(),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+              NSEvent.pressedMouseButtons == 0 else { return .deferred }
+        let result = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        NSLog("KeepCursor one-shot reconnect result: %d", result.rawValue)
+        if result != .success {
+            NSLog("KeepCursor one-shot reconnect failed: %d", result.rawValue)
+            return .failed
+        }
+        _ = restoreVisibility()
+        return .succeeded
+    }
+
+    /// Restore visibility only. WoW retains ownership of mouse capture and position.
+    /// Recheck live input here as well as in the polling policy: delayed requests
+    /// may run after the user starts a camera turn or switches to another app.
+    @discardableResult
+    static func restoreVisibility() -> Bool {
+        guard frontmostIsTarget(), NSEvent.pressedMouseButtons == 0 else { return false }
+        SkyLightCursor.forceShow()
         let display = CGMainDisplayID()
         for _ in 0..<8 { CGDisplayShowCursor(display) }
-
-        // 3. Re-associate mouse and cursor position
-        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-
-        guard includeWarp, NSEvent.pressedMouseButtons == 0 else { return }
-
-        // 4. Force hardware cursor repaint by nudging 1px and back
-        let loc = currentCursorLocationCG()
-        let nudged = CGPoint(x: loc.x + 1, y: loc.y)
-        CGWarpMouseCursorPosition(nudged)
-        CGWarpMouseCursorPosition(loc)
+        return true
     }
 
-    /// Cursor location in CoreGraphics (top-left origin) coordinates.
-    static func currentCursorLocationCG() -> CGPoint {
-        let mouse = NSEvent.mouseLocation // bottom-left origin
-        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
-        return CGPoint(x: mouse.x, y: screenHeight - mouse.y)
-    }
 }
 
 // MARK: - Always-Visible Cursor Overlay View & Window
@@ -420,9 +429,12 @@ final class CursorOverlayController {
             return
         }
 
-        overlayView.style = Settings.shared.overlayStyle
-        overlayView.colorName = Settings.shared.overlayColor
-        if overlayView.isPressed != isPressed {
+        let style = Settings.shared.overlayStyle
+        let color = Settings.shared.overlayColor
+        if overlayView.style != style || overlayView.colorName != color
+            || overlayView.isPressed != isPressed {
+            overlayView.style = style
+            overlayView.colorName = color
             overlayView.isPressed = isPressed
             overlayView.needsDisplay = true
         }
@@ -456,6 +468,8 @@ final class CursorOverlayController {
 // MARK: - Global Hotkey (⌥⌘C)
 
 final class Hotkey {
+    private(set) var handlerStatus: OSStatus = noErr
+    private(set) var registrationStatus: OSStatus = noErr
     private var ref: EventHotKeyRef?
     private var handler: EventHandlerRef?
     private let onFire: () -> Void
@@ -469,7 +483,7 @@ final class Hotkey {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind: UInt32(kEventHotKeyPressed))
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, ctx -> OSStatus in
+        handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, event, ctx -> OSStatus in
             guard let ctx else { return noErr }
             let me = Unmanaged<Hotkey>.fromOpaque(ctx).takeUnretainedValue()
             me.onFire()
@@ -478,7 +492,7 @@ final class Hotkey {
         }, 1, &spec, selfPtr, &handler)
 
         let id = EventHotKeyID(signature: OSType(0x4B435552 /* 'KCUR' */), id: 1)
-        RegisterEventHotKey(UInt32(kVK_ANSI_C),
+        registrationStatus = RegisterEventHotKey(UInt32(kVK_ANSI_C),
                             UInt32(optionKey | cmdKey),
                             id, GetApplicationEventTarget(), 0, &ref)
     }
@@ -544,13 +558,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkey: Hotkey?
     private let settings = Settings.shared
 
-    private var lastButtons: Int = 0
+    private var recovery = CursorRecoveryPolicy()
     private var restoreCount = 0
-
-    // Virtual cursor position that tracks trackpad deltas even during mouselook / relative mode
-    private var virtualPos: CGPoint = .zero
-    private var lastMouseLoc: CGPoint = .zero
+    private var activationGeneration = 0
     private var globalMouseMonitor: Any?
+    private var lastNativePosition = NSEvent.mouseLocation
+    private var startupReconnectRequested = CommandLine.arguments.contains("--recover-pointer-once")
+    private let startupRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 60
+    private var startupRecoveryPID: pid_t?
+    private var reconnectVerification: (pid: pid_t, position: CGPoint, deadline: Double)?
+    private var explicitRescue = ExplicitCursorRescue()
+    private var lastRescueResult: Int32?
+    private var lastRescuePID: pid_t?
+    private var gameTicks = 0
+    private var physicalMotionEvents = 0
+    private var lastDiagnosticsWrite = -Double.infinity
+    private let diagnosticsURL: URL? = {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--diagnostics-output"),
+              arguments.indices.contains(index + 1) else { return nil }
+        return URL(fileURLWithPath: arguments[index + 1])
+    }()
 
     private func noteRestore(flash: Bool = true) {
         restoreCount += 1
@@ -560,9 +588,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         setupStatusItem()
-
-        virtualPos = NSEvent.mouseLocation
-        lastMouseLoc = virtualPos
 
         // 1. App-activation notification: instant burst on Cmd-Tab back to WoW
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -577,130 +602,198 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }, nil)
 
-        // 3. Global Mouse Event Monitor:
-        //    Tracks physical trackpad/mouse delta events even when WoW disassociates
-        //    mouse position (CGAssociateMouseAndMouseCursorPosition(0)).
-        //    Ensures the circle overlay follows the user's hand, and restores the cursor
-        //    immediately on release.
+        // Passive evidence for a frozen pointer. Events pass through to the game.
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [
-            .mouseMoved,
-            .leftMouseDragged,
-            .rightMouseDragged,
-            .otherMouseDragged,
-            .leftMouseUp,
-            .rightMouseUp,
-            .otherMouseUp
+            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged
         ]) { [weak self] event in
-            self?.handleGlobalMouseEvent(event)
+            self?.observePhysicalMotion(event)
         }
 
-        // 4. Fast 60Hz gameplay loop:
-        //    - Smoothly positions the Always-Visible Overlay
-        //    - Enforces cursor association and visibility watchdog
-        //    - Detects button release transitions in real time
+        // The timer observes mouse position/buttons; it never posts input events.
         gameLoopTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
             self?.gameTick()
         }
 
         hotkey = Hotkey { [weak self] in
-            CursorFixer.restoreBurst(includeWarp: true)
-            self?.noteRestore()
+            self?.requestPointerRecovery()
+        }
+        if CommandLine.arguments.contains("--rescue-cursor-now") {
+            requestPointerRecovery()
+        }
+        writeDiagnostics(force: true)
+    }
+
+    private func attemptRestore(manual: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let buttons = NSEvent.pressedMouseButtons
+        recovery.observe(buttons: buttons, now: now)
+        if recovery.attemptRestore(
+            enabled: settings.enabled,
+            isTarget: CursorFixer.frontmostIsTarget(),
+            buttons: buttons,
+            cursorVisible: CursorFixer.isCursorVisible(),
+            now: now,
+            manual: manual,
+            restore: { CursorFixer.restoreVisibility() }
+        ) {
+            noteRestore(flash: manual)
         }
     }
 
-    private func handleGlobalMouseEvent(_ event: NSEvent) {
-        guard settings.enabled else { return }
-        let isTarget = CursorFixer.frontmostIsTarget()
-        guard isTarget else { return }
+    private func requestPointerRecovery() {
+        explicitRescue.request(now: ProcessInfo.processInfo.systemUptime)
+        writeDiagnostics(force: true)
+    }
 
-        let currentMouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 2560, height: 1600)
-
-        // If system mouseLocation is moving normally, keep virtualPos locked to it
-        if currentMouse != lastMouseLoc {
-            virtualPos = currentMouse
-            lastMouseLoc = currentMouse
-        } else if event.deltaX != 0 || event.deltaY != 0 {
-            // System mouse is stationary / disassociated by WoW (camera turn/steering)!
-            // Accumulate physical trackpad deltas so the circle tracks the user's trackpad movement
-            virtualPos.x += event.deltaX
-            virtualPos.y -= event.deltaY // Cocoa Y is inverted vs screen deltas
-            virtualPos.x = max(0, min(screen.width, virtualPos.x))
-            virtualPos.y = max(0, min(screen.height, virtualPos.y))
+    private func serviceExplicitRescue(now: Double) {
+        guard explicitRescue.pending else { return }
+        let previousState = explicitRescue.state
+        let result = explicitRescue.service(
+            frontPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            eventButtons: NSEvent.pressedMouseButtons,
+            hidButtons: CursorFixer.buttonMask(.hidSystemState),
+            sessionButtons: CursorFixer.buttonMask(.combinedSessionState), now: now
+        ) { pid in
+            let (outcome, error) = CursorFixer.rescueCursorNow(expectedPID: pid)
+            if let error {
+                lastRescueResult = error
+                lastRescuePID = pid
+            }
+            return outcome
         }
+        if result == .succeeded { noteRestore() }
+        if explicitRescue.state != previousState { writeDiagnostics(force: true) }
+    }
 
-        // Detect any mouse button release
-        if event.type == .leftMouseUp || event.type == .rightMouseUp || event.type == .otherMouseUp {
-            // Button released! Warp hardware cursor to where the user aimed the circle
-            let cgY = screen.height - virtualPos.y
-            CGWarpMouseCursorPosition(CGPoint(x: virtualPos.x, y: cgY))
-            CursorFixer.restoreBurst(includeWarp: false)
-            noteRestore(flash: false)
+    /// Overwrite one bounded local snapshot; never record coordinates or input text.
+    private func writeDiagnostics(force: Bool = false) {
+        guard let diagnosticsURL else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - lastDiagnosticsWrite >= 1 else { return }
+        lastDiagnosticsWrite = now
+        let front = NSWorkspace.shared.frontmostApplication
+        let frontPID = front?.processIdentifier
+        var snapshot: [String: Any] = [
+            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            "process_id": ProcessInfo.processInfo.processIdentifier,
+            "uptime_seconds": now,
+            "timer_ticks": gameTicks,
+            "enabled": settings.enabled,
+            "frontmost_pid": frontPID.map { Int($0) } ?? -1,
+            "frontmost_name": front?.localizedName ?? "none",
+            "frontmost_is_target": CursorFixer.frontmostIsTarget(),
+            "event_buttons": NSEvent.pressedMouseButtons,
+            "hid_buttons": CursorFixer.buttonMask(.hidSystemState),
+            "session_buttons": CursorFixer.buttonMask(.combinedSessionState),
+            "motion_monitor_installed": globalMouseMonitor != nil,
+            "physical_motion_events": physicalMotionEvents,
+            "hotkey_handler_status": hotkey?.handlerStatus ?? -1,
+            "hotkey_registration_status": hotkey?.registrationStatus ?? -1,
+            "explicit_rescue_pending": explicitRescue.pending,
+            "explicit_rescue_state": explicitRescue.state,
+            "explicit_rescue_attempts": explicitRescue.attempts,
+            "legacy_target_request_pending": startupReconnectRequested
+        ]
+        if let lastRescueResult { snapshot["last_association_error"] = lastRescueResult }
+        if let lastRescuePID { snapshot["last_rescue_pid"] = lastRescuePID }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: diagnosticsURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: diagnosticsURL.path)
+        } catch {
+            NSLog("KeepCursor diagnostic snapshot write failed")
         }
+    }
 
-        if settings.alwaysVisibleOverlay {
-            CursorOverlayController.shared.update(
-                mouseLocation: virtualPos,
-                isPressed: NSEvent.pressedMouseButtons != 0,
-                shouldShow: true
-            )
+    private func observePhysicalMotion(_ event: NSEvent) {
+        physicalMotionEvents += 1
+        guard settings.enabled, CursorFixer.frontmostIsTarget() else { return }
+        let mouse = NSEvent.mouseLocation
+        let moved = mouse != lastNativePosition
+        lastNativePosition = mouse
+        if let verification = reconnectVerification,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier == verification.pid,
+           NSEvent.pressedMouseButtons == 0, moved, mouse != verification.position {
+            NSLog("KeepCursor native pointer movement observed after reconnect")
+            reconnectVerification = nil
         }
+        // A normal screen-edge clamp is not a stalled game pointer.
+        let atEdge = NSScreen.screens.contains { screen in
+            let frame = screen.frame
+            return frame.insetBy(dx: -1, dy: -1).contains(mouse)
+                && (abs(mouse.x - frame.minX) <= 1 || abs(mouse.x - frame.maxX) <= 1
+                    || abs(mouse.y - frame.minY) <= 1 || abs(mouse.y - frame.maxY) <= 1)
+        }
+        recovery.recordMotion(cursorMoved: moved,
+                              deltaDistance: hypot(event.deltaX, event.deltaY),
+                              atScreenEdge: atEdge, buttons: NSEvent.pressedMouseButtons,
+                              now: ProcessInfo.processInfo.systemUptime)
     }
 
     private func gameTick() {
-        guard settings.enabled else {
-            CursorOverlayController.shared.hide()
-            return
-        }
-
+        gameTicks += 1
         let isTarget = CursorFixer.frontmostIsTarget()
-        let mouse = NSEvent.mouseLocation
         let buttons = NSEvent.pressedMouseButtons
-
-        if isTarget {
-            let screen = NSScreen.screens.first?.frame ?? CGRect(x: 0, y: 0, width: 2560, height: 1600)
-
-            // Sync with hardware position if it changed
-            if mouse != lastMouseLoc {
-                virtualPos = mouse
-                lastMouseLoc = mouse
-            }
-
-            // Update the Always-Visible Cursor Overlay
-            let showOverlay = settings.alwaysVisibleOverlay
-            CursorOverlayController.shared.update(
-                mouseLocation: virtualPos,
-                isPressed: buttons != 0,
-                shouldShow: showOverlay
-            )
-
-            // Detect mouse button release transition
-            if lastButtons != 0 && buttons == 0 {
-                let cgY = screen.height - virtualPos.y
-                CGWarpMouseCursorPosition(CGPoint(x: virtualPos.x, y: cgY))
-                CursorFixer.restoreBurst(includeWarp: false)
-                noteRestore(flash: false)
-            }
-
-            // IDLE WATCHDOG: When no buttons are held (idle navigation / moving trackpad without click)
-            if buttons == 0 {
-                // Ensure mouse position is NEVER disassociated while idle
-                CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-
-                // If hardware cursor is hidden by WoW, restore it immediately
-                if !CursorFixer.isCursorVisible() {
-                    CursorFixer.restoreBurst(includeWarp: false)
-                }
-            }
-
-            if settings.keepSize {
-                SkyLightCursor.enforceScale(Float(settings.cursorScale))
-            }
-        } else {
-            CursorOverlayController.shared.hide()
+        let now = ProcessInfo.processInfo.systemUptime
+        recovery.observe(buttons: buttons, now: now)
+        let mouse = NSEvent.mouseLocation
+        if mouse != lastNativePosition {
+            recovery.nativePointerMoved()
+            lastNativePosition = mouse
         }
 
-        lastButtons = buttons
+        // Show the fallback at the actual click location. A separate virtual
+        // pointer would imply clicks land somewhere WoW cannot receive them.
+        CursorOverlayController.shared.update(
+            mouseLocation: NSEvent.mouseLocation,
+            isPressed: false,
+            shouldShow: CursorRecoveryPolicy.shouldShowOverlay(
+                enabled: settings.enabled,
+                isTarget: isTarget,
+                overlayEnabled: settings.alwaysVisibleOverlay,
+                buttons: buttons
+            )
+        )
+
+        serviceExplicitRescue(now: now)
+        writeDiagnostics()
+        let targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if startupReconnectRequested,
+           now > startupRecoveryDeadline || (startupRecoveryPID != nil && startupRecoveryPID != targetPID) {
+            startupReconnectRequested = false
+            startupRecoveryPID = nil
+            recovery.cancelReconnectRequest()
+        }
+        if let verification = reconnectVerification,
+           now > verification.deadline || targetPID != verification.pid {
+            NSLog("KeepCursor reconnect movement not verified before timeout or focus change")
+            reconnectVerification = nil
+        }
+        guard settings.enabled, isTarget else { return }
+        if startupReconnectRequested {
+            if startupRecoveryPID == nil { startupRecoveryPID = targetPID }
+            recovery.requestReconnect()
+        }
+        if recovery.attemptReconnect(enabled: settings.enabled, isTarget: isTarget,
+                                     buttons: buttons, now: now, reconnect: {
+            let result = CursorFixer.reconnectMouse(expectedPID: targetPID)
+            if result != .deferred {
+                startupReconnectRequested = false
+                startupRecoveryPID = nil
+            }
+            if result == .succeeded, let targetPID {
+                reconnectVerification = (targetPID, NSEvent.mouseLocation, now + 10)
+            }
+            return result
+        }) {
+            noteRestore(flash: false)
+        }
+        // Repair a missing native cursor only after release has settled. Visibility
+        // repairs are limited to once per second, without association or warps.
+        attemptRestore()
+        if settings.keepSize, buttons == 0 {
+            SkyLightCursor.enforceScale(Float(settings.cursorScale))
+        }
     }
 
     private func setupStatusItem() {
@@ -725,16 +818,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.menu = nil
         } else {
             restoreNow()
-        }
-    }
-
-    private func returnFocusToGame() {
-        guard let game = CursorFixer.targetApp() else { return }
-        game.activate(options: [])
-        for delay in [0.15, 0.4] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                CursorFixer.restoreBurst(includeWarp: true)
-            }
         }
     }
 
@@ -764,8 +847,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Overlay Style Submenu
         let styleMenu = NSMenu()
         let styles: [(id: String, name: String)] = [
-            ("ring", "Combat Reticle (WoW Style - Recommended)"),
-            ("arrow", "Classic Pointer"),
+            ("ring", "Combat Reticle"),
+            ("arrow", "Classic Pointer (Recommended)"),
             ("dot", "Precision Dot")
         ]
         for s in styles {
@@ -861,23 +944,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Actions
 
     @objc private func appActivated(_ note: Notification) {
-        guard settings.enabled else { return }
-        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
-                as? NSRunningApplication else { return }
-        let isTarget = CursorFixer.isWoW(app)
-            || (settings.watchAllGames && CursorFixer.looksLikeFullscreenGame(app))
-        guard isTarget else { return }
+        activationGeneration += 1
+        recovery.reset()
+        CursorOverlayController.shared.hide()
+        guard settings.enabled,
+              let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
+                as? NSRunningApplication,
+              CursorFixer.isWoW(app)
+                || (settings.watchAllGames && CursorFixer.looksLikeFullscreenGame(app)) else {
+            // An unbound startup request waits for the first game focus. Once
+            // bound, leaving that target cancels it before any cursor API call.
+            if startupRecoveryPID != nil {
+                startupReconnectRequested = false
+                startupRecoveryPID = nil
+            }
+            return
+        }
+        if let boundPID = startupRecoveryPID, boundPID != app.processIdentifier {
+            startupReconnectRequested = false
+            startupRecoveryPID = nil
+        }
 
-        for delay in [0.0, 0.15, 0.4, 0.8] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                CursorFixer.restoreBurst(includeWarp: true)
+        let generation = activationGeneration
+        let targetPID = app.processIdentifier
+        for delay in [0.3, 0.6, 0.9] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      self.activationGeneration == generation,
+                      self.settings.enabled,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else { return }
+                self.attemptRestore()
             }
         }
-        noteRestore(flash: false)
     }
 
     @objc private func toggleEnabled() {
         settings.enabled.toggle()
+        activationGeneration += 1
+        recovery.reset()
+        startupReconnectRequested = false
+        startupRecoveryPID = nil
+        if !settings.enabled { CursorOverlayController.shared.hide() }
         rebuildMenu()
     }
 
@@ -912,9 +1019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restoreNow() {
-        CursorFixer.restoreBurst(includeWarp: true)
-        noteRestore()
-        returnFocusToGame()
+        requestPointerRecovery()
     }
 
     @objc private func openSite() {

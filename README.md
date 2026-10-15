@@ -1,55 +1,86 @@
 # KeepCursor
 
-**Stop World of Warcraft (and other macOS games) from losing your mouse cursor when you Command-Tab.**
+Keep the cursor visible in World of Warcraft on macOS after Command-Tab or a cursor visibility glitch.
 
-A tiny, free menu-bar app for macOS. When you alt-tab out of WoW and back, the in-game cursor often vanishes — you have to wiggle the mouse, right-click, or do the awkward "hold both mouse buttons" trick to get it back. KeepCursor fixes that automatically.
+A small menu-bar helper from [Bates LLC](https://batesai.org). Contact: [help@batesai.org](mailto:help@batesai.org).
 
-![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue) ![Universal](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-green) ![Notarized](https://img.shields.io/badge/Apple-Notarized-success)
+## Local beta: 2.3.0b3
+
+This beta fixes gameplay interference from the previous cursor recovery implementation. That implementation repeatedly reconnected the mouse to the cursor, tracked a separate virtual pointer, and warped the real pointer after mouse-button release. Those operations could interfere with WoW's relative mouse capture and make the overlay appear disconnected from actual clicks.
+
+The beta keeps cursor recovery enabled:
+
+- Accepts an explicit one-shot rescue for the current foreground application, including the desktop. It waits for the same foreground PID and released AppKit/HID/session mouse buttons to remain stable for 250 ms, rechecks immediately before the API call, and consumes that attempt even on error.
+- Keeps automatic game recovery scoped to WoW (or the existing opt-in watch-all-games setting). Its stall recovery requires physical movement evidence; explicit rescue does not depend on receiving movement-monitor events.
+- Restores native cursor **visibility** when WoW is frontmost and the cursor is hidden, after all mouse buttons have been released for 250 ms.
+- Limits automatic visibility repairs to once per second. A failed final input check does not suppress the next safe retry.
+- Displays a click-through fallback pointer at the actual macOS cursor position. The fallback hides during camera turns, clicks, and drags, and returns on release.
+- Uses a classic arrow by default; saved overlay styles and colors are preserved. The menu can select an arrow, ring, or dot.
+- Rechecks focus and button state before repairs. Delayed activation callbacks are canceled by focus changes or pausing.
+- Leaves normal relative movement, button events, and cursor position under the game's control. A reconnect requires settled released buttons, current target focus, and a final live input check.
+
+The stall detector requires at least three real movement events, at least 12 points of cumulative movement, and 250 ms of unchanged native cursor position with no mouse button held. It ignores screen-edge clamping and subpixel movement. It tries once per stall episode, rearms only after native movement or a new mouse-button hold, and spaces attempts by at least two seconds. Failed API calls consume their attempt too.
+
+**Option-Command-C** or a left click on the menu-bar icon requests one reconnect plus visibility recovery for the current foreground app. This explicit action also works while automatic game recovery is paused. If focus changes before the attempt, it waits for the new foreground application and released buttons to settle again. A final input-check deferral restarts the full 250 ms grace period. Unserviced requests expire after 60 seconds.
+
+For one explicitly requested rescue on a new app launch, use `--rescue-cursor-now`. An optional `--diagnostics-output /absolute/path/rescue-diagnostics.json` writes one bounded local snapshot, overwritten at most once per second plus state changes. It includes foreground app name/PID, button masks, request/attempt/result state, timer and motion counts, and hotkey registration return codes. It records no coordinates or input text; keep the file outside Git. Start only one app instance. The older `--recover-pointer-once` remains game-scoped.
+
+Recovery is best effort: Apple's cursor APIs are documented for foreground callers, and macOS may ignore or reject a background helper's repair. An API success does not prove that game input recovered. The app logs the reconnect return code and can passively observe subsequent native pointer movement; it never changes app focus automatically. If input remains stuck, switch away from WoW and back, then press and release each mouse button normally to let the game reset its input state. The overlay always uses the actual click position.
+
+The local beta has passed compilation, signature verification, and input safety regression tests. Live WoW verification is pending; see [TEST_PLAN.md](TEST_PLAN.md). It has not been published as a public release or notarized.
+
+## Manual WoW camera reset
+
+A [community report on Blizzard's forum](https://eu.forums.blizzard.com/en/wow/t/mac-os-mojave-wow-freezing-when-alt-tab/3249/8) describes resetting in-game mouse look when an external cursor helper is insufficient. This workaround is community-reported and **unverified in this session**.
+
+With WoW focused and all mouse buttons released, press **Enter**, paste this command into chat, then press **Enter**:
+
+```lua
+/run if not IsMouseButtonDown() then MouselookStart() C_Timer.After(0, function() MouselookStop() end) end
+```
+
+Try pointer movement, a normal click, and camera turning, and record the result. This is a manual fallback. Consider an optional companion addon only if the manual reset proves useful; retain user control over when it runs.
+
+## Controls
+
+| Action | Control |
+| --- | --- |
+| Restore visibility now | **Option-Command-C**, or left-click the menu-bar icon |
+| Open settings | Right-click or Control-click the menu-bar icon |
+| Pause automatic game recovery and hide the fallback | **Pause KeepCursor** in the menu |
+| Select pointer appearance | **Cursor Overlay Style** and **Cursor Color** |
+| Keep a larger cursor | **Keep cursor size** and its slider |
+
+The restore shortcut requests a single input reconnect and visibility repair for the current foreground app. It waits for stable focus and released buttons. Settings and rescue requests do not bring an application to the front.
 
 ## Download
 
-Grab the latest **[KeepCursor.zip](https://github.com/danielalanbates/keepcursor/releases/latest)**, unzip, drag `KeepCursor.app` to `/Applications`, and open it. It's Apple-notarized, so it just runs — no Gatekeeper warnings, no right-click-to-open.
+Published, notarized builds are available from [GitHub Releases](https://github.com/danielalanbates/keepcursor/releases/latest). The 2.3.0b3 beta source is being validated before a new public release. Do not treat an older release as containing this fix.
 
-A cursor icon appears in your menu bar. That's it. WoW will keep its cursor from now on.
+## Build and verify
 
-## Why the old fixes don't work well
-
-The macOS cursor disappearing bug is actually three problems at once:
-
-1. **The hide/show counter goes negative.** macOS tracks cursor visibility with a per-app counter. When WoW grabs and releases the cursor across an app switch, the counter can be driven below zero — so a single `CGDisplayShowCursor()` (what most naive tools do) isn't enough to bring it back.
-2. **The mouse gets "disassociated" from the cursor** after a camera grab.
-3. **The hardware cursor sprite isn't repainted**, so even a balanced counter shows nothing until the cursor physically moves.
-
-A dumb once-per-second `CGDisplayShowCursor` loop misses all three. KeepCursor fixes all three, **exactly on the alt-tab event**:
-
-- Calls `CGDisplayShowCursor` repeatedly to unwind the negative counter.
-- Calls `CGAssociateMouseAndMouseCursorPosition(true)` to re-link the mouse.
-- Nudges the cursor 1px and back to force WindowServer to repaint it.
-
-It hooks `NSWorkspace.didActivateApplicationNotification`, so the fix fires the instant WoW comes back to the front (plus a light safety re-check while WoW is frontmost, to catch the in-game-alert case).
-
-## Features
-
-- **Zero config** — install, open, done.
-- **Only touches the cursor while a game is frontmost** — leaves your normal cursor and accessibility settings completely alone the rest of the time.
-- **Global hotkey ⌥⌘C** — force-restore the cursor any time.
-- **Launch at login** toggle (built in, via `SMAppService`).
-- **"Watch all games"** mode for non-WoW full-screen games.
-- **No special permissions** — no Accessibility, no Input Monitoring.
-- Universal binary (Apple Silicon + Intel), Apple-notarized.
-
-## Build from source
+Requires macOS 13+ and the Xcode command-line tools (`swiftc`). Two Swift source files, no third-party dependencies. `build.sh` builds for the current Mac's architecture and applies an ad-hoc signature.
 
 ```bash
 git clone https://github.com/danielalanbates/keepcursor
 cd keepcursor
-./build.sh                 # produces /tmp/keepcursor-build/KeepCursor.app (ad-hoc signed)
-# or, for a notarized release build (requires a Developer ID + notary profile):
-./release.sh
+BUILD_DIR="$HOME/Downloads/keepcursor-build" ./build.sh
+
+swiftc Sources/CursorRecoveryPolicy.swift Tests/CursorRecoveryPolicyTests.swift \
+  -o "$HOME/Downloads/keepcursor-policy-tests"
+"$HOME/Downloads/keepcursor-policy-tests"
 ```
 
-Requires the Xcode command-line tools (`swiftc`). Single Swift file, no dependencies.
+The policy tests do not launch an app or change the real mouse. `release.sh` is a separate, explicit notarized release workflow; run it only after live verification. Installing a local beta does not require running it.
+
+## Implementation notes
+
+`Sources/CursorRecoveryPolicy.swift` contains the testable release settling, retry interval, focus, pause, and overlay policy. `Sources/main.swift` owns the menu-bar UI, native-position overlay, and visibility APIs. The final visibility operation checks live focus and buttons again, because the input may change after an activation callback was queued.
+
+An inactive WoW process does not make another foreground application a game-recovery target. The diagnostics distinguish the actual foreground application from a running background game. The helper passively observes mouse movement for stall evidence. It does not post mouse events, install an event tap, accumulate a separate virtual pointer, or warp the cursor. Mouse association changes are confined to the guarded single-request/single-stall recovery path. Overlay windows ignore mouse events. Appearance changes invalidate the view immediately.
+
+[Apple's CGDisplayShowCursor documentation](https://developer.apple.com/documentation/coregraphics/cgdisplayshowcursor(_:)) explains the cursor hide count and foreground-app limitation. [Apple's cursor-control guide](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/QuartzDisplayServicesConceptual/Articles/MouseCursor.html) documents the foreground requirement for mouse association. The optional SkyLight visibility and cursor-size APIs are private and may be unavailable on future macOS versions; missing visibility queries fail toward quiet behavior rather than repeated repairs.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Made by [Bates LLC](https://batesai.org).
+All rights reserved. Copyright (c) 2026 Bates LLC / Daniel Bates. See [LICENSE](LICENSE) for the existing PolyForm Noncommercial terms and the commercial revenue-sharing rider.
