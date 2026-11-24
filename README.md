@@ -4,11 +4,11 @@
 
 A tiny, free menu-bar app for macOS. When you alt-tab out of WoW and back, the in-game cursor often vanishes — you have to wiggle the mouse, right-click, or do the awkward "hold both mouse buttons" trick to get it back. KeepCursor fixes that automatically.
 
-![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue) ![Universal](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-green) ![Notarized](https://img.shields.io/badge/Apple-Notarized-success)
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue) ![Universal](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-green)
 
 ## Download
 
-Grab the latest **[KeepCursor.zip](https://github.com/danielalanbates/keepcursor/releases/latest)**, unzip, drag `KeepCursor.app` to `/Applications`, and open it. It's Apple-notarized, so it just runs — no Gatekeeper warnings, no right-click-to-open.
+Grab the latest **[KeepCursor.zip](https://github.com/danielalanbates/keepcursor/releases/latest)**, unzip, drag `KeepCursor.app` to `/Applications`, and open it. If macOS blocks the first open, allow it under **System Settings → Privacy & Security → Open Anyway**.
 
 A cursor icon appears in your menu bar. That's it. WoW will keep its cursor from now on.
 
@@ -36,7 +36,7 @@ It hooks `NSWorkspace.didActivateApplicationNotification`, so the fix fires the 
 - **Launch at login** toggle (built in, via `SMAppService`).
 - **"Watch all games"** mode for non-WoW full-screen games.
 - **No special permissions** — no Accessibility, no Input Monitoring.
-- Universal binary (Apple Silicon + Intel), Apple-notarized.
+- Universal binary (Apple Silicon + Intel).
 
 ## Build from source
 
