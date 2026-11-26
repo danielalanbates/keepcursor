@@ -1,0 +1,8 @@
+<Bindings>
+	<Binding name="KEEPCURSOR_UNLOCK" header="KEEPCURSOR" category="ADDONS">
+		KeepCursor_Unlock("key")
+	</Binding>
+	<Binding name="KEEPCURSOR_MACUNLOCK" category="ADDONS">
+		KeepCursor_MacUnlock()
+	</Binding>
+</Bindings>
