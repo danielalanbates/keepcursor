@@ -2,7 +2,7 @@
 ## Title: KeepCursor
 ## Notes: Unlocks a frozen, invisible mouse pointer on macOS. Type /kc, or bind a key under Key Bindings > AddOns.
 ## Author: Bates LLC
-## Version: 1.1.0
+## Version: 1.1.1
 ## SavedVariables: KeepCursorDB
 
 KeepCursor.lua

@@ -95,13 +95,29 @@ end
 -- Called by the Mac app's hidden key. WoW knows when mouselook is intentional
 -- (a held button, a steer key, a combat-mode addon), so it is left alone then:
 -- only the proven bug (pointer captured while WoW is NOT mouselooking) is reset.
+local MAC_LOOK_CONFIRM, macLookSince = 180, nil
 function KeepCursor_MacUnlock()
 	if not db then return end
-	if IsMouselooking() or AnyButtonDown() or Busy() then
+	if AnyButtonDown() or SteerKeyDown() or Busy() then
+		macLookSince = nil
 		db.stats.mac_ignored = (db.stats.mac_ignored or 0) + 1
-		Log("mac unlock ignored (mouselook/button/busy)")
+		Log("mac unlock ignored (button/steer key/busy)")
 		return
 	end
+	-- Mouselooking with no button or steer key held is either a toggled
+	-- mouselook or a STUCK one (missed button-up). Ignore the first press; the
+	-- Mac app only presses again (>=10 s later) if the pointer stayed frozen,
+	-- so a second press inside MAC_LOOK_CONFIRM means stuck: reset it.
+	if IsMouselooking() then
+		local now = GetTime()
+		if not macLookSince or now - macLookSince > MAC_LOOK_CONFIRM then
+			macLookSince = now
+			db.stats.mac_ignored = (db.stats.mac_ignored or 0) + 1
+			Log("mac unlock deferred (mouselook without button; waiting for repeat)")
+			return
+		end
+	end
+	macLookSince = nil
 	KeepCursor_Unlock("mac")
 end
 
